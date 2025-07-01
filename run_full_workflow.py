@@ -69,7 +69,7 @@ def main():
     parser.add_argument('--skip-extract', action='store_true',
                        help='Skip cavity extraction')
     parser.add_argument('--skip-download', action='store_true',
-                       help='Skip AlphaFold model download')
+                       help='Skip AlphaFold model extraction')
     parser.add_argument('--skip-convert', action='store_true',
                        help='Skip PDB to PDBQT conversion')
     parser.add_argument('--test-mode', action='store_true',
@@ -96,10 +96,10 @@ def main():
     else:
         check_file_exists('cavity_mapping.csv', 'Cavity mapping')
     
-    # Step 3: AlphaFold Model Download (Recommended)
+    # Step 3: AlphaFold Model Extraction (Recommended)
     if not args.skip_download:
-        if not run_script('download_cavityspace_structures.py', 'CavitySpace structure download'):
-            logging.warning("AlphaFold download failed. Continuing with extracted cavity data.")
+        if not run_script('extract_alphafold_models.py', 'Local AlphaFold structure extraction'):
+            logging.warning("AlphaFold extraction failed. Continuing with extracted cavity data.")
             # Don't stop workflow - this is optional but recommended
     else:
         check_file_exists('alphafold_mapping.csv', 'AlphaFold mapping')
@@ -155,7 +155,7 @@ def main():
         'alphafold_mapping.csv',
         'pdbqt_mapping.csv',
         'extracted_cavities/',
-        'alphafold_models/',
+        'alphafold_structures/',
         'converted_pdbqt/',
         'consensus_docking_results/'
     ]

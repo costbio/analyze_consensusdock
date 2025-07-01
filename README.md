@@ -12,7 +12,7 @@ The docking workflow consists of five main steps:
 
 1. **UniProt Mapping Generation** (`prepare_uniprot_mapping.py`)
 2. **Cavity Extraction** (`extract_cavities.py`)
-3. **CavitySpace Structure Download** (`download_cavityspace_structures.py`) - **RECOMMENDED**
+3. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **RECOMMENDED**
 4. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
 5. **Batch Docking Execution** (`batch_dock.py`)
 
@@ -44,27 +44,28 @@ python extract_cavities.py
 - `extracted_cavities/` - Directory with extracted PDB files
 - `cavity_extraction.log` - Extraction log
 
-### 3. download_cavityspace_structures.py ⭐ **NEW - RECOMMENDED**
-Downloads full AlphaFold models for UniProt IDs found in cavity mapping. This replaces the "vacant" receptor files with complete AlphaFold structures for better docking results.
+### 3. extract_alphafold_models.py ⭐ **NEW - RECOMMENDED**
+Downloads full AlphaFold models for UniProt IDs found in cavity mapping. This extracts structures directly from the local AlphaFold database archive, avoiding network limitations. Replaces "vacant" receptor files with complete AlphaFold structures for better docking results.
 
 **Features**:
-- **Parallel downloading** with configurable thread count
-- **Resume capability**: Skips already downloaded files
+- **Offline extraction** from local AlphaFold database
+- **Parallel processing** with configurable thread count
+- **Resume capability**: Skips already extracted files
 - **Progress tracking**: Detailed logging and progress bars
-- **Quality data**: Downloads both PDB models and confidence JSON files
+- **Complete structures**: Includes all atoms needed for docking
 - **Automatic integration**: Works seamlessly with existing workflow
 
-**Configuration**: Edit `NUM_THREADS` based on your network capacity
+**Configuration**: Edit `ALPHAFOLD_ARCHIVE` path and `NUM_THREADS` for optimal performance
 
 **Usage**:
 ```bash
-python download_cavityspace_structures.py
+python extract_alphafold_models.py
 ```
 
 **Output**:
-- `cavityspace_structures/` - Directory with AlphaFold structures organized by UniProt ID
-- `cavityspace_mapping.csv` - Updated mapping with CavitySpace file paths
-- `cavityspace_download.log` - Download log
+- `alphafold_structures/` - Directory with AlphaFold structures organized by UniProt ID
+- `alphafold_mapping.csv` - Updated mapping with AlphaFold file paths
+- `alphafold_extraction.log` - Extraction log
 
 **Requirements**:
 - Internet connection for downloading from AlphaFold database
@@ -157,8 +158,8 @@ python prepare_uniprot_mapping.py
 # Step 2: Extract cavities (can take a while, run once)
 python extract_cavities.py
 
-# Step 3: Download CavitySpace structures (RECOMMENDED - better than vacant files)
-python download_cavityspace_structures.py
+# Step 3: Extract AlphaFold structures (RECOMMENDED - better than vacant files)
+python extract_alphafold_models.py
 
 # Step 4: Convert PDB to PDBQT (RECOMMENDED - saves significant time later)
 python convert_pdb_to_pdbqt.py
@@ -191,7 +192,7 @@ The workflow runner automatically:
 Before running the scripts, update the configuration paths in each script:
 
 - **extract_cavities.py**: `CAVITY_TARBALL_FOLDER`
-- **download_cavityspace_structures.py**: `NUM_THREADS` (adjust for your network capacity)
+- **extract_alphafold_models.py**: `NUM_THREADS` (adjust for extraction performance)
 - **convert_pdb_to_pdbqt.py**: `NUM_THREADS` (adjust for your CPU)
 - **batch_dock.py**: `CONSENSUS_DOCKER_SCRIPT`, `PROCESSED_LIGAND_SDF_FOLDER`, `DRUG_TO_PROTEIN_TSV`
 
@@ -201,7 +202,7 @@ Before running the scripts, update the configuration paths in each script:
 your_working_directory/
 ├── prepare_uniprot_mapping.py
 ├── extract_cavities.py
-├── download_cavityspace_structures.py  # NEW
+├── extract_alphafold_models.py         # NEW
 ├── convert_pdb_to_pdbqt.py             # NEW
 ├── batch_dock.py
 ├── run_full_workflow.py                # NEW - Automated workflow runner
