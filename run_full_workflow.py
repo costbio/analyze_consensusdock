@@ -4,7 +4,7 @@ Complete Workflow Runner
 This script runs the entire consensus docking workflow in the correct order.
 
 Usage:
-    python run_full_workflow.py [--skip-uniprot] [--skip-extract] [--skip-download] [--skip-convert]
+    python run_full_workflow.py [--skip-uniprot] [--skip-extract] [--skip-identify] [--skip-alphafold] [--skip-fixing] [--skip-convert]
 
 Example:
     # Run full workflow
@@ -16,8 +16,14 @@ Example:
     # Skip cavity extraction (if already done)  
     python run_full_workflow.py --skip-extract
     
+    # Skip required structures identification (if already done)
+    python run_full_workflow.py --skip-identify
+    
     # Skip AlphaFold download
-    python run_full_workflow.py --skip-download
+    python run_full_workflow.py --skip-alphafold
+    
+    # Skip PDB fixing
+    python run_full_workflow.py --skip-fixing
     
     # Skip PDBQT conversion
     python run_full_workflow.py --skip-convert
@@ -68,8 +74,12 @@ def main():
                        help='Skip UniProt mapping generation')
     parser.add_argument('--skip-extract', action='store_true',
                        help='Skip cavity extraction')
-    parser.add_argument('--skip-download', action='store_true',
+    parser.add_argument('--skip-identify', action='store_true',
+                       help='Skip required structures identification')
+    parser.add_argument('--skip-alphafold', action='store_true',
                        help='Skip AlphaFold model extraction')
+    parser.add_argument('--skip-fixing', action='store_true',
+                       help='Skip PDB fixing (hydrogens)')
     parser.add_argument('--skip-convert', action='store_true',
                        help='Skip PDB to PDBQT conversion')
     parser.add_argument('--test-mode', action='store_true',
@@ -96,15 +106,31 @@ def main():
     else:
         check_file_exists('cavity_mapping.csv', 'Cavity mapping')
     
-    # Step 3: AlphaFold Model Extraction (Recommended)
-    if not args.skip_download:
-        if not run_script('extract_alphafold_models.py', 'Local AlphaFold structure extraction'):
+    # Step 3: Identify Required Structures (NEW - MUST RUN BEFORE ALPHAFOLD EXTRACTION)
+    if not args.skip_identify:
+        if not run_script('identify_required_structures.py', 'Required structures identification'):
+            logging.warning("Required structures identification failed. Continuing with all structures.")
+            # Don't stop workflow - this helps optimize but isn't critical
+    else:
+        check_file_exists('required_structures.csv', 'Required structures mapping')
+    
+    # Step 4: AlphaFold Model Extraction (Recommended - now extracts only required structures)
+    if not args.skip_alphafold:
+        if not run_script('extract_alphafold_models.py', 'Local AlphaFold structure extraction (required only)'):
             logging.warning("AlphaFold extraction failed. Continuing with extracted cavity data.")
             # Don't stop workflow - this is optional but recommended
     else:
         check_file_exists('alphafold_mapping.csv', 'AlphaFold mapping')
     
-    # Step 4: PDB to PDBQT Conversion (Optional but recommended)
+    # Step 5: Fix Required PDBs (Add hydrogens)
+    if not args.skip_fixing:
+        if not run_script('fix_required_pdbs.py', 'PDB fixing (adding hydrogens)'):
+            logging.warning("PDB fixing failed. Continuing without fixed structures.")
+            # Don't stop workflow - this is recommended but not required
+    else:
+        check_file_exists('fixed_mapping.csv', 'Fixed structures mapping')
+    
+    # Step 6: PDB to PDBQT Conversion (Optional but recommended)
     if not args.skip_convert:
         if not run_script('convert_pdb_to_pdbqt.py', 'PDB to PDBQT conversion'):
             logging.warning("PDBQT conversion failed. Docking will convert files on-the-fly.")
@@ -112,7 +138,7 @@ def main():
     else:
         check_file_exists('pdbqt_mapping.csv', 'PDBQT mapping')
     
-    # Step 5: Batch Docking
+    # Step 7: Batch Docking
     logging.info("Starting: Batch docking execution")
     
     # Check prerequisites
@@ -153,9 +179,12 @@ def main():
         'uniprot_gene_mapping.csv',
         'cavity_mapping.csv',
         'alphafold_mapping.csv',
+        'required_structures.csv',
+        'fixed_mapping.csv',
         'pdbqt_mapping.csv',
         'extracted_cavities/',
         'alphafold_structures/',
+        'fixed_structures/',
         'converted_pdbqt/',
         'consensus_docking_results/'
     ]

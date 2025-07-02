@@ -1,20 +1,35 @@
-# Consensus Docking Analysis Workflow
+# Consensus## Workflow Overview
+
+The docking workflow consists of seven main steps and processes **small molecule drugs only**:
+
+1. **UniProt Mapping Generation** (`prepare_uniprot_mapping.py`)
+2. **Cavity Extraction** (`extract_cavities.py`)
+3. **Required Structures Identification** (`identify_required_structures.py`) - **NEW** (filters for small molecules)
+4. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **UPDATED** (extracts only required structures)
+5. **PDB Fixing** (`fix_required_pdbs.py`) - **RECOMMENDED**
+6. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
+7. **Batch Docking Execution** (`batch_dock.py`) - **UPDATED** (processes small molecules only)alysis Workflow
 
 This repository contains scripts for running batch consensus doc**Prerequisites**:
 - `uniprot_gene_mapping.csv` (from step 1)
 - `cavity_mapping.csv` (from step 2)
-- `cavityspace_mapping.csv` (from step 3, recommended)
+- `cavityspace_mapping.csv` (from step 3, recom- **extract_alphafold_models.py**: `NUM_THREADS` (adjust for extraction performance)
+- **identify_required_structures.py**: File paths for drug-protein data and ligands
+- **fix_required_pdbs.py**: `NUM_THREADS` (adjust for fixing performance)
+- **convert_pdb_to_pdbqt.py**: `NUM_THREADS` (adjust for your CPU cores)nded)
 - `pdbqt_mapping.csv` (from step 4, optional but recommended)xperiments using AlphaFold structures and cavity data.
 
 ## Workflow Overview
 
-The docking workflow consists of five main steps:
+The docking workflow consists of seven main steps:
 
 1. **UniProt Mapping Generation** (`prepare_uniprot_mapping.py`)
 2. **Cavity Extraction** (`extract_cavities.py`)
-3. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **RECOMMENDED**
-4. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
-5. **Batch Docking Execution** (`batch_dock.py`)
+3. **Required Structures Identification** (`identify_required_structures.py`) - **NEW & RECOMMENDED**
+4. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **RECOMMENDED** (now extracts only required structures)
+5. **PDB Fixing** (`fix_required_pdbs.py`) - **RECOMMENDED**
+6. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
+7. **Batch Docking Execution** (`batch_dock.py`)
 
 ## Scripts
 
@@ -44,10 +59,33 @@ python extract_cavities.py
 - `extracted_cavities/` - Directory with extracted PDB files
 - `cavity_extraction.log` - Extraction log
 
-### 3. extract_alphafold_models.py ⭐ **NEW - RECOMMENDED**
-Downloads full AlphaFold models for UniProt IDs found in cavity mapping. This extracts structures directly from the local AlphaFold database archive, avoiding network limitations. Replaces "vacant" receptor files with complete AlphaFold structures for better docking results.
+### 3. identify_required_structures.py ⭐ **NEW - OPTIMIZATION**
+Identifies which AlphaFold structures are actually needed based on drug-protein interactions and ligand availability. This allows selective processing of only the structures that will be used for docking, dramatically improving efficiency.
 
 **Features**:
+- **Selective identification**: Only identifies structures needed for docking
+- **Drug-protein matching**: Based on interaction data and available ligands
+- **Priority scoring**: Ranks targets by interaction count
+- **Mapping integration**: Works with all downstream scripts
+- **Significant speedup**: Reduces processing time for large datasets
+
+**Configuration**: Update file paths in script for drug-protein data and ligand folders
+
+**Usage**:
+```bash
+python identify_required_structures.py
+```
+
+**Output**:
+- `required_structures.csv` - List of required structures for docking
+- `required_structures.log` - Processing log
+
+### 4. extract_alphafold_models.py ⭐ **UPDATED - RECOMMENDED**
+Downloads full AlphaFold models for required structures only (if step 3 was run). This extracts structures directly from the local AlphaFold database archive, avoiding network limitations. Now optimized to only extract structures that will actually be used.
+
+**Features**:
+- **Selective extraction**: Only extracts required structures (from `required_structures.csv`)
+- **Fallback capability**: Uses `cavity_mapping.csv` if required structures not available
 - **Offline extraction** from local AlphaFold database
 - **Parallel processing** with configurable thread count
 - **Resume capability**: Skips already extracted files
@@ -68,11 +106,62 @@ python extract_alphafold_models.py
 - `alphafold_extraction.log` - Extraction log
 
 **Requirements**:
-- Internet connection for downloading from AlphaFold database
-- `requests` Python library
+- Local AlphaFold database archive
+- `tarfile` and `gzip` Python libraries
 
-### 4. convert_pdb_to_pdbqt.py ⭐ **NEW - OPTIONAL BUT RECOMMENDED**
-Converts receptor PDB files to PDBQT format with parallel processing. This step is optional but highly recommended as it significantly speeds up docking by pre-converting files. **Uses AlphaFold models if available from step 3.**
+Identifies which AlphaFold structures are actually needed based on drug-protein interactions. This optimization step ensures we only process structures that will be used in docking, making the workflow more efficient.
+
+**Features**:
+- **Smart filtering** based on drug-protein interaction data
+- **Ligand availability checking** to ensure corresponding SDF files exist
+- **Priority ranking** by interaction count
+- **Detailed reporting** of required vs available structures
+
+**Configuration**: Edit paths for drug-protein data and ligand folder
+
+**Usage**:
+```bash
+python identify_required_structures.py
+```
+
+**Output**:
+- `required_structures.csv` - List of structures needed for docking
+- `required_structures.log` - Processing log
+
+**Requirements**:
+- Drug-protein interaction TSV file
+- UniProt mapping and cavity mapping files
+- Processed ligand SDF folder
+
+### 5. fix_required_pdbs.py ⭐ **NEW - RECOMMENDED**
+
+Fixes PDB files by adding hydrogens and performing other corrections needed for accurate docking. This step only processes the structures identified as required, making it much more efficient than fixing all structures.
+
+**Features**:
+- **Selective processing** of only required structures
+- **Hydrogen addition** at physiological pH (7.0)
+- **Missing atom/residue fixing** using PDBFixer
+- **Parallel processing** with configurable thread count
+- **Resume capability** - skips already fixed structures
+
+**Configuration**: Edit `NUM_THREADS` and `ALPHAFOLD_ARCHIVE` path
+
+**Usage**:
+```bash
+python fix_required_pdbs.py
+```
+
+**Output**:
+- `fixed_structures/` - Directory with fixed PDB files
+- `fixed_mapping.csv` - Updated mapping with fixed structure paths
+- `pdb_fixing.log` - Processing log
+
+**Requirements**:
+- `pdbfixer` and `openmm` packages
+- Required structures list from step 4
+
+### 6. convert_pdb_to_pdbqt.py ⭐ **OPTIONAL BUT RECOMMENDED**
+Converts receptor PDB files to PDBQT format with parallel processing. This step is optional but highly recommended as it significantly speeds up docking by pre-converting files. **Uses fixed structures if available from step 5.**
 
 **Features**:
 - **Parallel processing** with configurable thread count
@@ -96,12 +185,14 @@ python convert_pdb_to_pdbqt.py
 **Requirements**:
 - OpenBabel Python bindings (`openbabel-python` or `conda install openbabel`)
 
-### 5. batch_dock.py
-Main docking execution script that uses pre-generated mappings to run consensus docking jobs.
+### 7. batch_dock.py ⭐ **UPDATED**
+Main docking execution script that uses pre-generated mappings to run consensus docking jobs for **small molecule drugs only**.
 
 **Features**:
+- **Small molecule filtering**: Only processes small molecule drugs from DrugBank
 - Uses pre-extracted cavity mappings (faster startup)
 - **Automatic PDBQT detection**: Uses pre-converted PDBQT files if available for faster docking
+- **Smart mapping priority**: Uses fixed structures > AlphaFold structures > cavity structures
 - Supports multiple cavities per protein
 - Test mode for validation
 - Resume capability (skips completed jobs)
@@ -109,9 +200,10 @@ Main docking execution script that uses pre-generated mappings to run consensus 
 **Prerequisites**:
 - `uniprot_gene_mapping.csv` (from step 1)
 - `cavity_mapping.csv` (from step 2)
-- `cavityspace_mapping.csv` (from step 3, recommended for better results)
-- `fixed_pdb_mapping.csv` (from step 4, optional but recommended)
-- `pdbqt_mapping.csv` (from step 5, optional but recommended)
+- `required_structures.csv` (from step 3, recommended for efficiency)
+- `alphafold_mapping.csv` (from step 4, recommended for better results)
+- `fixed_mapping.csv` (from step 5, optional but recommended)
+- `pdbqt_mapping.csv` (from step 6, optional but recommended)
 
 **Usage**:
 ```bash
@@ -119,7 +211,7 @@ python batch_dock.py
 ```
 
 **Output**:
-- `consensus_docking_results/` - Docking results
+- `consensus_docking_results/` - Docking results for small molecule drugs only
 - `docking_automation.log` - Docking log
 
 ## Key Improvements
@@ -192,9 +284,11 @@ The workflow runner automatically:
 Before running the scripts, update the configuration paths in each script:
 
 - **extract_cavities.py**: `CAVITY_TARBALL_FOLDER`
+- **identify_required_structures.py**: `DRUG_TO_PROTEIN_TSV`, `SMALL_MOLECULE_DRUGS_CSV`, `PROCESSED_LIGAND_SDF_FOLDER`
 - **extract_alphafold_models.py**: `NUM_THREADS` (adjust for extraction performance)
+- **fix_required_pdbs.py**: `NUM_THREADS` (adjust for fixing performance)
 - **convert_pdb_to_pdbqt.py**: `NUM_THREADS` (adjust for your CPU)
-- **batch_dock.py**: `CONSENSUS_DOCKER_SCRIPT`, `PROCESSED_LIGAND_SDF_FOLDER`, `DRUG_TO_PROTEIN_TSV`
+- **batch_dock.py**: `CONSENSUS_DOCKER_SCRIPT`, `PROCESSED_LIGAND_SDF_FOLDER`, `DRUG_TO_PROTEIN_TSV`, `SMALL_MOLECULE_DRUGS_CSV`
 
 ## File Organization
 
@@ -203,13 +297,17 @@ your_working_directory/
 ├── prepare_uniprot_mapping.py
 ├── extract_cavities.py
 ├── extract_alphafold_models.py         # NEW
+├── identify_required_structures.py     # NEW
+├── fix_required_pdbs.py               # NEW
 ├── convert_pdb_to_pdbqt.py             # NEW
 ├── batch_dock.py
 ├── run_full_workflow.py                # NEW - Automated workflow runner
 ├── uniprot_gene_mapping.csv            # Generated by step 1
 ├── cavity_mapping.csv                  # Generated by step 2
-├── cavityspace_mapping.csv             # Generated by step 3 (recommended)
-├── pdbqt_mapping.csv                   # Generated by step 4 (optional)
+├── alphafold_mapping.csv               # Generated by step 3 (recommended)
+├── required_structures.csv             # Generated by step 4 (optimization)
+├── fixed_mapping.csv                   # Generated by step 5 (recommended)
+├── pdbqt_mapping.csv                   # Generated by step 6 (optional)
 ├── extracted_cavities/               # Generated by step 2
 │   ├── AF-P12345-F1-model_v1/
 │   │   ├── ...vacant_1.pdb
