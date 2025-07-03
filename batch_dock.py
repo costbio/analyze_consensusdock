@@ -41,6 +41,8 @@ import re
 import time
 import logging
 import glob
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 # --- Configuration ---
 # --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
@@ -56,7 +58,16 @@ PDBQT_MAPPING_CSV = "pdbqt_mapping.csv" # Input file from convert_pdb_to_pdbqt.p
 LOG_FILE = "docking_automation.log"
 # --- TEST MODE: Set to True to run only 3 docking jobs for testing ---
 TEST_MODE = True
-MAX_TEST_JOBS = 3
+MAX_TEST_JOBS = 40
+# --- PARALLELIZATION SETTINGS ---
+MAX_PARALLEL_JOBS = 40  # Maximum number of parallel docking jobs
+EXHAUSTIVENESS = 12     # Exhaustiveness parameter for consensus_docker.py
+DOCKING_TIMEOUT = 300   # Timeout for each docking job in seconds (5 minutes)
+# --- CPU RESOURCE MANAGEMENT ---
+MAX_TOTAL_CPUS = 60     # Total CPU cores available on the system
+SMINA_CPU_ALLOCATION = 12  # CPU cores per smina job (should match EXHAUSTIVENESS for optimal performance)
+LEDOCK_CPU_ALLOCATION = 1  # CPU cores per ledock job (single-threaded)
+GOLD_CPU_ALLOCATION = 1    # CPU cores per gold job (single-threaded)
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
@@ -77,6 +88,9 @@ logging.getLogger().addHandler(console_handler)
 logging.info("Starting batch consensus docking workflow.")
 if TEST_MODE:
     logging.info(f"*** RUNNING IN TEST MODE - LIMITED TO {MAX_TEST_JOBS} DOCKING JOBS ***")
+logging.info(f"*** PARALLEL EXECUTION ENABLED - UP TO {MAX_PARALLEL_JOBS} CONCURRENT JOBS ***")
+logging.info(f"*** EXHAUSTIVENESS PARAMETER: {EXHAUSTIVENESS} ***")
+logging.info(f"*** DOCKING TIMEOUT: {DOCKING_TIMEOUT/60:.1f} MINUTES ***")
 logging.info(f"Consensus Docker Script: {CONSENSUS_DOCKER_SCRIPT}")
 logging.info(f"Processed Ligand SDF Folder: {PROCESSED_LIGAND_SDF_FOLDER}")
 logging.info(f"Drug-to-Protein TSV: {DRUG_TO_PROTEIN_TSV}")
@@ -304,6 +318,141 @@ def check_docking_completion(output_folder):
 # --- NOTE: Cavity extraction is now handled by extract_cavities.py ---
 # Run extract_cavities.py first to generate cavity_mapping.csv before running this script
 
+def run_single_docking_job(job_data):
+    """
+    Run a single docking job - designed to work with multiprocessing and timeout support.
+    
+    Parameters
+    ----------
+    job_data : dict
+        Dictionary containing all job parameters
+        
+    Returns
+    -------
+    dict
+        Results of the docking job
+    """
+    # Extract job parameters
+    job_idx = job_data['job_idx']
+    drugbank_id = job_data['drugbank_id']
+    uniprot_id = job_data['uniprot_id']
+    gene_name = job_data['gene_name']
+    ligand_sdf = job_data['ligand_sdf']
+    receptor_pdb = job_data['receptor_pdb']
+    receptor_pdbqt = job_data['receptor_pdbqt']
+    pocket_pdb = job_data['pocket_pdb']
+    current_outfolder = job_data['current_outfolder']
+    
+    # Get configuration from job_data
+    CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
+    SMINA_PATH = job_data['smina_path']
+    LEDOCK_PATH = job_data['ledock_path']
+    LEPRO_PATH = job_data['lepro_path']
+    GOLD_PATH = job_data['gold_path']
+    NUM_THREADS = job_data['num_threads']
+    CUTOFF_VALUE = job_data['cutoff_value']
+    EXHAUSTIVENESS = job_data['exhaustiveness']
+    
+    process_id = os.getpid()
+    
+    try:
+        # Check if the job was already completed
+        if check_docking_completion(current_outfolder):
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'skipped',
+                'message': 'Job already completed',
+                'process_id': process_id
+            }
+        
+        # Build the command
+        command = [
+            "python", CONSENSUS_DOCKER_SCRIPT,
+            "--outfolder", current_outfolder,
+            "--smina_path", SMINA_PATH,
+            "--ledock_path", LEDOCK_PATH,
+            "--lepro_path", LEPRO_PATH,
+            "--gold_path", GOLD_PATH,
+            "--ligand_sdf", ligand_sdf,
+            "--receptor_pdb", receptor_pdb,
+            "--pocket_pdb", pocket_pdb,
+            "--num_threads", str(NUM_THREADS),
+            "--cutoff_value", str(CUTOFF_VALUE),
+            "--exhaustiveness", str(EXHAUSTIVENESS)
+        ]
+        
+        # Add PDBQT file if available for faster processing
+        if receptor_pdbqt and os.path.exists(receptor_pdbqt):
+            command.extend(["--receptor_pdbqt", receptor_pdbqt])
+        
+        # Run the command with timeout
+        timeout_seconds = job_data.get('timeout', 600)  # Default 10 minutes
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, 
+                                  check=False, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'timeout',
+                'message': f'Docking timed out after {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)',
+                'process_id': process_id
+            }
+        
+        if result.returncode == 0:
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'completed',
+                'message': f'Successfully docked {drugbank_id} into {pocket_pdb}',
+                'process_id': process_id
+            }
+        else:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'failed',
+                'message': f'Docking failed. Return code: {result.returncode}',
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'process_id': process_id
+            }
+    
+    except Exception as e:
+        return {
+            'success': False,
+            'job_idx': job_idx,
+            'drugbank_id': drugbank_id,
+            'uniprot_id': uniprot_id,
+            'gene_name': gene_name,
+            'pocket_pdb': pocket_pdb,
+            'current_outfolder': current_outfolder,
+            'action': 'error',
+            'message': f'Exception occurred: {str(e)}',
+            'process_id': process_id
+        }
+
 # --- Part 3: Main Docking Execution Logic ---
 
 def run_docking(
@@ -373,6 +522,12 @@ def run_docking(
 
         # Each UniProt ID can have multiple pocket/receptor pairs
         for receptor_pdb, pocket_pdb, receptor_pdbqt in pdb_info_dict[uniprot_id]:
+            # Create unique job identifier to detect duplicates
+            pocket_filename = Path(pocket_pdb).stem
+            cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
+            cavity_num = cavity_match.group(1) if cavity_match else "unknown"
+            job_signature = f"{drugbank_id}_{uniprot_id}_{cavity_num}"
+            
             total_docking_jobs += 1
             docking_jobs.append({
                 'drugbank_id': drugbank_id,
@@ -381,19 +536,56 @@ def run_docking(
                 'ligand_sdf': ligand_sdf_path,
                 'receptor_pdb': receptor_pdb,
                 'receptor_pdbqt': receptor_pdbqt,  # May be None if not available
-                'pocket_pdb': pocket_pdb
+                'pocket_pdb': pocket_pdb,
+                'job_signature': job_signature  # For duplicate detection
             })
     
     logging.info(f"Total potential docking jobs: {total_docking_jobs}")
     logging.info(f"Skipped {skipped_jobs} jobs due to missing files or mappings.")
     
+    # Remove duplicate jobs
+    docking_jobs = remove_duplicate_jobs(docking_jobs)
+    
+    # Save job preparation summary
+    save_job_preparation_summary(total_docking_jobs, skipped_jobs, len(docking_jobs))
+    
+    # Preview jobs before execution
+    if docking_jobs:
+        preview_df = preview_docking_jobs(docking_jobs, "docking_jobs_preview.csv")
+        
+        # Ask user for confirmation before proceeding
+        print(f"\n{'='*60}")
+        print(f"DOCKING JOBS PREVIEW")
+        print(f"{'='*60}")
+        print(f"Total jobs to execute: {len(docking_jobs)}")
+        print(f"Preview saved to: docking_jobs_preview.csv")
+        print(f"{'='*60}")
+        
+        if not TEST_MODE:
+            response = input("Do you want to proceed with these docking jobs? (y/n): ").lower().strip()
+            if response not in ['y', 'yes']:
+                logging.info("User chose not to proceed. Exiting.")
+                sys.exit(0)
+        else:
+            logging.info("TEST MODE: Proceeding automatically")
+    
     # Limit jobs for testing if TEST_MODE is enabled
     if TEST_MODE and len(docking_jobs) > MAX_TEST_JOBS:
         logging.info(f"TEST MODE: Limiting to first {MAX_TEST_JOBS} jobs out of {len(docking_jobs)} available jobs.")
         docking_jobs = docking_jobs[:MAX_TEST_JOBS]
+        # Update preview with limited jobs
+        if docking_jobs:
+            preview_df = preview_docking_jobs(docking_jobs, "docking_jobs_preview_test_mode.csv")
 
-    start_time = time.time()
-    for job_idx, job in enumerate(tqdm(docking_jobs, desc="Executing Docking Jobs", unit="job")):
+    # Preview docking jobs and save to CSV
+    preview_file = "docking_jobs_preview.csv"
+    preview_df = preview_docking_jobs(docking_jobs, preview_file)
+    
+    # Prepare job data for multiprocessing
+    logging.info(f"Preparing {len(docking_jobs)} jobs for parallel execution with {MAX_PARALLEL_JOBS} processes...")
+    job_data_list = []
+    
+    for job_idx, job in enumerate(docking_jobs):
         drugbank_id = job['drugbank_id']
         uniprot_id = job['uniprot_id']
         gene_name = job['gene_name']
@@ -403,8 +595,6 @@ def run_docking(
         pocket_pdb = job['pocket_pdb']
 
         # Determine output folder name for this specific job
-        # Example: DB12010_ACVR1_Q16539_cavity_result_1, DB12010_ACVR1_Q16539_cavity_result_2, etc.
-        # We need to extract the specific cavity ID from the pocket_pdb filename
         pocket_filename = Path(pocket_pdb).stem
         # Extract cavity number using regex
         cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
@@ -419,73 +609,278 @@ def run_docking(
         output_folder_name = f"{drugbank_id}_{gene_name}_{uniprot_id}_{pocket_suffix}"
         current_outfolder = os.path.join(output_base_folder, output_folder_name)
         
-        # Check if the job was already completed using our improved check
-        if check_docking_completion(current_outfolder):
-            tqdm.write(f"Skipping already completed job: {current_outfolder}")
-            executed_docking_jobs += 1 # Count as completed, not necessarily executed in this run
-            continue
+        # Prepare job data dictionary
+        job_data = {
+            'job_idx': job_idx,
+            'drugbank_id': drugbank_id,
+            'uniprot_id': uniprot_id,
+            'gene_name': gene_name,
+            'ligand_sdf': ligand_sdf,
+            'receptor_pdb': receptor_pdb,
+            'receptor_pdbqt': receptor_pdbqt,
+            'pocket_pdb': pocket_pdb,
+            'current_outfolder': current_outfolder,
+            # Configuration parameters
+            'consensus_docker_script': CONSENSUS_DOCKER_SCRIPT,
+            'smina_path': SMINA_PATH,
+            'ledock_path': LEDOCK_PATH,
+            'lepro_path': LEPRO_PATH,
+            'gold_path': GOLD_PATH,
+            'num_threads': NUM_THREADS,
+            'cutoff_value': CUTOFF_VALUE,
+            'exhaustiveness': EXHAUSTIVENESS,
+            'timeout': DOCKING_TIMEOUT
+        }
+        job_data_list.append(job_data)
+    
+    # Execute jobs in parallel with timeout support
+    logging.info(f"Starting parallel execution with {MAX_PARALLEL_JOBS} processes...")
+    logging.info(f"Each job will use --exhaustiveness {EXHAUSTIVENESS}")
+    logging.info(f"Timeout per job: {DOCKING_TIMEOUT/60:.1f} minutes")
+    
+    start_time = time.time()
+    completed_jobs = 0
+    failed_jobs = 0
+    timeout_jobs = 0
+    skipped_jobs_runtime = 0
+    unique_processes = set()
+    last_progress_log = time.time()
+    progress_log_interval = 30  # Log progress every 30 seconds
+    
+    with ProcessPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as executor:
+        # Submit all jobs
+        future_to_job = {executor.submit(run_single_docking_job, job_data): job_data for job_data in job_data_list}
         
-        # Note: Don't create the output folder here - consensus_docker.py creates it itself
-        # and will error if the folder already exists
-
-        command = [
-            "python", CONSENSUS_DOCKER_SCRIPT,
-            "--outfolder", current_outfolder,
-            "--smina_path", SMINA_PATH,
-            "--ledock_path", LEDOCK_PATH,
-            "--lepro_path", LEPRO_PATH,
-            "--gold_path", GOLD_PATH,
-            "--ligand_sdf", ligand_sdf,
-            "--receptor_pdb", receptor_pdb,
-            "--pocket_pdb", pocket_pdb,
-            "--num_threads", str(NUM_THREADS),
-            "--cutoff_value", str(CUTOFF_VALUE)
-        ]
-        
-        # Add PDBQT file if available for faster processing
-        if receptor_pdbqt and os.path.exists(receptor_pdbqt):
-            command.extend(["--receptor_pdbqt", receptor_pdbqt])
-            logging.debug(f"Using pre-converted PDBQT file: {receptor_pdbqt}")
-        else:
-            logging.debug(f"No PDBQT file available, consensus_docker.py will convert from PDB")
-
-        try:
-            # Use subprocess.run for better control and error handling
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            
-            if result.returncode == 0:
-                logging.info(f"Successfully docked {drugbank_id} into {pocket_pdb}. Output in: {current_outfolder}")
-                executed_docking_jobs += 1
-            else:
-                logging.error(f"Docking failed for {drugbank_id} into {pocket_pdb}. Return code: {result.returncode}")
-                logging.error(f"STDOUT: {result.stdout}")
-                logging.error(f"STDERR: {result.stderr}")
-                tqdm.write(f"Error: Docking failed for {drugbank_id} into {pocket_pdb}. Check log for details.")
-
-        except FileNotFoundError:
-            logging.error(f"Error: Command not found. Is '{CONSENSUS_DOCKER_SCRIPT}' correct and executable?")
-            sys.exit(1)
-        except Exception as e:
-            logging.error(f"An unexpected error occurred during docking for {drugbank_id} into {pocket_pdb}: {e}")
-            tqdm.write(f"Error: An unexpected error occurred. Check log for details.")
-
-        # ETA Calculation
-        elapsed_time = time.time() - start_time
-        avg_time_per_job = elapsed_time / (job_idx + 1)
-        remaining_jobs = len(docking_jobs) - (job_idx + 1)
-        eta_seconds = avg_time_per_job * remaining_jobs
-        
-        m, s = divmod(eta_seconds, 60)
-        h, m = divmod(m, 60)
-        tqdm.write(f"Estimated time remaining: {int(h)}h {int(m)}m {int(s)}s")
-
+        # Process results with progress bar
+        completed_futures = 0
+        for future in tqdm(as_completed(future_to_job), total=len(job_data_list), 
+                         desc="Processing Docking Jobs", unit="job"):
+            try:
+                result = future.result()
+                completed_futures += 1
+                
+                # Track unique processes
+                if 'process_id' in result:
+                    unique_processes.add(result['process_id'])
+                
+                if result['success']:
+                    if result['action'] == 'completed':
+                        completed_jobs += 1
+                        logging.info(f"Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                    elif result['action'] == 'skipped':
+                        skipped_jobs_runtime += 1
+                        logging.debug(f"Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                else:
+                    if result['action'] == 'timeout':
+                        timeout_jobs += 1
+                        logging.warning(f"Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                    else:
+                        failed_jobs += 1
+                        logging.error(f"Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                        if 'stdout' in result and result['stdout']:
+                            logging.error(f"STDOUT: {result['stdout']}")
+                        if 'stderr' in result and result['stderr']:
+                            logging.error(f"STDERR: {result['stderr']}")
+                
+                # Log progress periodically to the log file
+                current_time = time.time()
+                if current_time - last_progress_log >= progress_log_interval:
+                    total_processed = completed_jobs + failed_jobs + timeout_jobs + skipped_jobs_runtime
+                    percent_complete = (completed_futures / len(job_data_list)) * 100
+                    elapsed_time = current_time - start_time
+                    avg_time_per_job = elapsed_time / completed_futures if completed_futures > 0 else 0
+                    remaining_jobs = len(job_data_list) - completed_futures
+                    estimated_time_remaining = remaining_jobs * avg_time_per_job
+                    
+                    # Format elapsed time and ETA in human-readable format
+                    def format_time(seconds):
+                        if seconds < 60:
+                            return f"{seconds:.0f}s"
+                        elif seconds < 3600:
+                            return f"{seconds/60:.1f}m"
+                        else:
+                            return f"{seconds/3600:.1f}h"
+                    
+                    elapsed_str = format_time(elapsed_time)
+                    eta_str = format_time(estimated_time_remaining) if estimated_time_remaining > 0 else "N/A"
+                    
+                    logging.info(f"PROGRESS: {percent_complete:.1f}% complete "
+                               f"({completed_futures}/{len(job_data_list)} jobs processed) | "
+                               f"✓{completed_jobs} completed, ✗{failed_jobs} failed, ⏱{timeout_jobs} timeout, ◊{skipped_jobs_runtime} skipped | "
+                               f"Elapsed: {elapsed_str}, ETA: {eta_str}")
+                    last_progress_log = current_time
+                        
+            except Exception as e:
+                failed_jobs += 1
+                completed_futures += 1
+                job_data = future_to_job[future]
+                logging.error(f"Exception in job {job_data['job_idx']+1}: {e}")
+    
+    # Calculate final statistics
+    elapsed_time = time.time() - start_time
+    executed_docking_jobs = completed_jobs + skipped_jobs_runtime
+    
+    # Log process usage statistics
+    logging.info(f"Used {len(unique_processes)} unique processes out of {MAX_PARALLEL_JOBS} configured")
+    if len(unique_processes) == 1:
+        logging.warning("Only 1 process was used! Parallelization may not be working correctly.")
+    else:
+        logging.info(f"✓ Parallel execution working with {len(unique_processes)} processes")
+    
     logging.info(f"\n--- Docking Summary ---")
     if TEST_MODE:
         logging.info(f"*** TEST MODE COMPLETED - RAN {min(len(docking_jobs), MAX_TEST_JOBS)} OUT OF {total_docking_jobs} POTENTIAL JOBS ***")
     logging.info(f"Total potential docking jobs (before checking existence): {total_docking_jobs}")
-    logging.info(f"Total jobs attempted/completed (including skips if output exists): {executed_docking_jobs}")
+    logging.info(f"Jobs completed successfully: {completed_jobs}")
+    logging.info(f"Jobs skipped (already completed): {skipped_jobs_runtime}")
+    logging.info(f"Jobs failed: {failed_jobs}")
+    logging.info(f"Jobs timed out (>{DOCKING_TIMEOUT/60:.1f} minutes): {timeout_jobs}")
+    logging.info(f"Total jobs attempted/completed (including skips): {executed_docking_jobs}")
     logging.info(f"Total jobs skipped initially (missing ligand/uniprot/pdb info): {skipped_jobs}")
+    logging.info(f"Total execution time: {elapsed_time:.2f} seconds")
+    logging.info(f"Average time per job: {elapsed_time/len(docking_jobs):.2f} seconds")
     logging.info(f"Script finished.")
+
+def preview_docking_jobs(docking_jobs, preview_file="docking_jobs_preview.csv"):
+    """
+    Create a preview of all docking jobs and save to CSV file.
+    
+    Parameters
+    ----------
+    docking_jobs : list
+        List of docking job dictionaries
+    preview_file : str
+        Path to save the preview CSV file
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the preview information
+    """
+    if not docking_jobs:
+        logging.warning("No docking jobs to preview")
+        return pd.DataFrame()
+    
+    # Create preview data
+    preview_data = []
+    for i, job in enumerate(docking_jobs):
+        # Extract cavity number from pocket filename
+        pocket_filename = Path(job['pocket_pdb']).stem
+        cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
+        cavity_num = cavity_match.group(1) if cavity_match else "unknown"
+        
+        # Check if PDBQT file exists
+        pdbqt_exists = job['receptor_pdbqt'] and os.path.exists(job['receptor_pdbqt'])
+        
+        preview_data.append({
+            'Job_Index': i + 1,
+            'DrugBank_ID': job['drugbank_id'],
+            'Gene_Name': job['gene_name'],
+            'UniProt_ID': job['uniprot_id'],
+            'Cavity_Number': cavity_num,
+            'Job_Signature': job['job_signature'],
+            'Ligand_SDF': job['ligand_sdf'],
+            'Receptor_PDB': job['receptor_pdb'],
+            'Receptor_PDBQT': job['receptor_pdbqt'] if job['receptor_pdbqt'] else 'N/A',
+            'PDBQT_Exists': pdbqt_exists,
+            'Pocket_PDB': job['pocket_pdb'],
+            'Ligand_Exists': os.path.exists(job['ligand_sdf']),
+            'Receptor_Exists': os.path.exists(job['receptor_pdb']),
+            'Pocket_Exists': os.path.exists(job['pocket_pdb'])
+        })
+    
+    # Create DataFrame
+    preview_df = pd.DataFrame(preview_data)
+    
+    # Save to CSV
+    preview_df.to_csv(preview_file, index=False)
+    
+    # Print summary statistics
+    total_jobs = len(preview_df)
+    unique_ligands = preview_df['DrugBank_ID'].nunique()
+    unique_proteins = preview_df['UniProt_ID'].nunique()
+    unique_cavities = len(preview_df.groupby(['UniProt_ID', 'Cavity_Number']))
+    pdbqt_available = preview_df['PDBQT_Exists'].sum()
+    
+    print(f"\n{'='*60}")
+    print(f"DOCKING JOBS PREVIEW SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total jobs to execute: {total_jobs}")
+    print(f"Unique ligands (DrugBank IDs): {unique_ligands}")
+    print(f"Unique proteins (UniProt IDs): {unique_proteins}")
+    print(f"Unique protein-cavity combinations: {unique_cavities}")
+    print(f"Jobs with pre-converted PDBQT files: {pdbqt_available}")
+    print(f"Preview saved to: {preview_file}")
+    print(f"{'='*60}")
+    
+    return preview_df
+
+def remove_duplicate_jobs(docking_jobs):
+    """
+    Remove duplicate docking jobs based on job signature.
+    
+    Parameters
+    ----------
+    docking_jobs : list
+        List of docking job dictionaries
+        
+    Returns
+    -------
+    list
+        List of unique docking jobs
+    """
+    seen_signatures = set()
+    unique_jobs = []
+    duplicates_removed = 0
+    
+    for job in docking_jobs:
+        signature = job['job_signature']
+        if signature not in seen_signatures:
+            seen_signatures.add(signature)
+            unique_jobs.append(job)
+        else:
+            duplicates_removed += 1
+            logging.debug(f"Removed duplicate job: {signature}")
+    
+    if duplicates_removed > 0:
+        logging.info(f"Removed {duplicates_removed} duplicate jobs")
+        logging.info(f"Unique jobs remaining: {len(unique_jobs)}")
+    
+    return unique_jobs
+
+def save_job_preparation_summary(total_jobs, skipped_jobs, final_jobs):
+    """
+    Save a summary of job preparation statistics.
+    
+    Parameters
+    ----------
+    total_jobs : int
+        Total number of potential jobs
+    skipped_jobs : int
+        Number of jobs skipped due to missing files
+    final_jobs : int
+        Number of jobs after deduplication
+    """
+    summary_data = {
+        'Metric': [
+            'Total potential jobs',
+            'Jobs skipped (missing files)',
+            'Jobs after deduplication',
+            'Duplicates removed'
+        ],
+        'Count': [
+            total_jobs,
+            skipped_jobs,
+            final_jobs,
+            total_jobs - skipped_jobs - final_jobs
+        ]
+    }
+    
+    summary_df = pd.DataFrame(summary_data)
+    summary_file = "job_preparation_summary.csv"
+    summary_df.to_csv(summary_file, index=False)
+    
+    logging.info(f"Job preparation summary saved to: {summary_file}")
 
 # --- Main execution block ---
 if __name__ == "__main__":
