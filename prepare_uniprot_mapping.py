@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 # --- Configuration ---
 DRUG_TO_PROTEIN_TSV = "/opt/data/multiscale_interactome_data/1_drug_to_protein.tsv"
-UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv"q
+UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv"
 LOG_FILE = "uniprot_preparation.log"
 
 # Set up logging

@@ -260,8 +260,11 @@ def prepare_extraction_tasks(structures_df, archive_path, output_dir):
     with tarfile.open(archive_path, 'r') as tar:
         found_structures = find_structures_in_archive(tar, required_structures)
     
-    # Prepare extraction tasks
+    # Prepare extraction tasks and track statistics
     extraction_tasks = []
+    skipped_existing = 0
+    not_in_archive = 0
+    
     for _, row in tqdm(unique_combinations.iterrows(), total=len(unique_combinations), desc="Preparing extraction tasks"):
         uniprot_id = row['UniProt_ID']
         fragment_id = row['Fragment_ID']
@@ -270,15 +273,17 @@ def prepare_extraction_tasks(structures_df, archive_path, output_dir):
         # Check if structure is available in archive
         if alphafold_id not in found_structures:
             logging.debug(f"Structure not found in archive: {alphafold_id}")
+            not_in_archive += 1
             continue
         
         # Generate local paths
         fragment_dir = os.path.join(output_dir, uniprot_id, f"F{fragment_id}")
         output_path = os.path.join(fragment_dir, f"{alphafold_id}-model_{DATABASE_VERSION}.pdb")
         
-        # Check if file already exists
+        # Check if file already exists (skip extraction if present)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             logging.debug(f"AlphaFold structure already exists for {uniprot_id} F{fragment_id}")
+            skipped_existing += 1
             continue
         
         extraction_tasks.append({
@@ -295,13 +300,15 @@ def prepare_extraction_tasks(structures_df, archive_path, output_dir):
         'unique_uniprot_ids': len(structures_df['UniProt_ID'].unique()),
         'found_in_archive': len(found_structures),
         'extraction_tasks': len(extraction_tasks),
-        'already_extracted': len(found_structures) - len(extraction_tasks)
+        'already_extracted': skipped_existing,
+        'not_in_archive': not_in_archive
     }
     
     logging.info(f"Found {stats['unique_uniprot_ids']} unique UniProt IDs with {stats['total_combinations']} fragments")
     logging.info(f"Available in archive: {stats['found_in_archive']} structures")
+    logging.info(f"Already extracted (skipped): {stats['already_extracted']} structures")
+    logging.info(f"Not in archive: {stats['not_in_archive']} structures")
     logging.info(f"Prepared {stats['extraction_tasks']} extraction tasks")
-    logging.info(f"Already extracted: {stats['already_extracted']} structures")
     
     return extraction_tasks, stats
 
@@ -365,10 +372,15 @@ def main():
     extraction_tasks, stats = prepare_extraction_tasks(structures_df, ALPHAFOLD_ARCHIVE, OUTPUT_AF_DIR)
     
     if not extraction_tasks:
-        logging.info("No extraction tasks needed. All AlphaFold structures already extracted.")
+        logging.info("No extraction tasks needed. All required AlphaFold structures are already available.")
+        logging.info(f"Found {stats['already_extracted']} already extracted structures")
+        logging.info(f"Not in archive: {stats['not_in_archive']} structures")
+        if stats['already_extracted'] > 0:
+            logging.info("Time saved by reusing existing AlphaFold structures: Significant!")
     else:
         # Perform parallel extractions
         logging.info(f"Starting parallel extraction of {len(extraction_tasks)} AlphaFold structures...")
+        logging.info(f"Skipping {stats['already_extracted']} already extracted structures")
         
         successful_extractions = 0
         failed_extractions = 0
@@ -389,7 +401,9 @@ def main():
                     failed_extractions += 1
                     logging.warning(f"Failed to extract {result['uniprot_id']} F{result['fragment_id']}: {result['error']}")
         
-        logging.info(f"Extraction completed: {successful_extractions} successful, {failed_extractions} failed")
+        logging.info(f"New extractions: {successful_extractions} successful, {failed_extractions} failed")
+        logging.info(f"Total structures now available: {stats['already_extracted'] + successful_extractions}")
+        logging.info(f"Time saved by skipping existing files: Significant!")
     
     # Create AlphaFold mapping CSV
     alphafold_df = create_alphafold_mapping(structures_df, OUTPUT_AF_DIR)

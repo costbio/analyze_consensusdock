@@ -48,7 +48,7 @@ CAVITY_MAPPING_CSV = "cavity_mapping.csv"    # Fallback input from extract_cavit
 OUTPUT_PDBQT_DIR = "converted_pdbqt"         # Output directory for PDBQT files
 OUTPUT_MAPPING_CSV = "pdbqt_mapping.csv"     # Output mapping with PDBQT paths
 LOG_FILE = "pdb_to_pdbqt_conversion.log"
-NUM_THREADS = 8  # Adjust based on your CPU cores
+NUM_THREADS = 60  # Adjust based on your CPU cores
 PH_VALUE = 7.4   # Protonation pH
 
 # Set up logging
