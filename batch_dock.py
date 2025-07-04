@@ -47,7 +47,7 @@ import multiprocessing
 # --- Configuration ---
 # --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
 CONSENSUS_DOCKER_SCRIPT = "/home/onur/repos/consensus_docking/consensus_docker.py"
-PROCESSED_LIGAND_SDF_FOLDER = "/home/onur/experiments/cavity_space_consensus_docking/drugbank_approved_split" # The output folder from your RDKit 3D processing script
+PROCESSED_LIGAND_SDF_FOLDER = "/media/onur/Elements/cavity_space_consensus_docking/drugbank_approved_split" # The output folder from your RDKit 3D processing script
 DRUG_TO_PROTEIN_TSV = "/opt/data/multiscale_interactome_data/1_drug_to_protein.tsv"
 SMALL_MOLECULE_DRUGS_CSV = "/opt/data/drugbank/small_molecule_drug_links.csv"  # Small molecule drugs only
 UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv" # Input file from prepare_uniprot_mapping.py
@@ -288,7 +288,7 @@ def check_docking_completion(output_folder):
         output_folder (str): Path to the docking output folder
         
     Returns:
-        bool: True if the job appears to be completed, False otherwise
+        bool: True if the job appears to be completed with valid output, False otherwise
     """
     if not os.path.exists(output_folder):
         return False
@@ -297,27 +297,59 @@ def check_docking_completion(output_folder):
     if not os.listdir(output_folder):
         return False
     
-    # Look for typical consensus docking output files
-    # Adjust these patterns based on what consensus_docker.py actually produces
+    # Look for typical consensus docking output files with size validation
     success_indicators = [
-        "consensus_results.csv",
-        "consensus_scores.txt", 
-        "docking_summary.log",
-        "*.sdf",  # Any SDF files (docked poses)
-        "*/results.txt"  # Results in subdirectories
+        ("consensus_results.csv", 100),  # (pattern, minimum_size_bytes)
+        ("consensus_scores.txt", 50), 
+        ("docking_summary.log", 100),
+        ("*.sdf", 1000),  # SDF files should be reasonably large
+        ("*.pdb", 500),   # PDB files should have meaningful content
+        ("*.mol2", 500),  # MOL2 files should have meaningful content
+        ("*/results.txt", 50)  # Results in subdirectories
     ]
     
-    for pattern in success_indicators:
-        if glob.glob(os.path.join(output_folder, pattern)):
-            logging.debug(f"Found completion indicator: {pattern} in {output_folder}")
-            return True
+    valid_files_found = 0
     
-    # If no specific indicators, check if there are multiple files/folders
-    # indicating some substantial output was generated
-    contents = os.listdir(output_folder)
-    if len(contents) >= 3:  # Arbitrary threshold - adjust as needed
-        logging.debug(f"Output folder {output_folder} has {len(contents)} items, considering complete")
+    for pattern, min_size in success_indicators:
+        matching_files = glob.glob(os.path.join(output_folder, pattern))
+        for file_path in matching_files:
+            if os.path.isfile(file_path) and os.path.getsize(file_path) >= min_size:
+                logging.debug(f"Found valid completion indicator: {file_path} ({os.path.getsize(file_path)} bytes)")
+                valid_files_found += 1
+                if valid_files_found >= 2:  # Require at least 2 valid files for confidence
+                    return True
+    
+    # Additional check: look for subdirectories with valid docking results
+    subdirs = ['smina', 'gold', 'ledock']
+    valid_subdirs = 0
+    
+    for subdir in subdirs:
+        subdir_path = os.path.join(output_folder, subdir)
+        if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
+            subdir_files = os.listdir(subdir_path)
+            for file in subdir_files:
+                file_path = os.path.join(subdir_path, file)
+                if (os.path.isfile(file_path) and os.path.getsize(file_path) > 0 and
+                    (file.endswith('.sdf') or file.endswith('.pdb') or file.endswith('.mol2'))):
+                    valid_subdirs += 1
+                    logging.debug(f"Found valid output in {subdir}: {file}")
+                    break
+    
+    # If we have at least 2 valid subdirectories with output, consider it complete
+    if valid_subdirs >= 2:
         return True
+    
+    # Final fallback: check if there are multiple substantial files
+    # indicating some meaningful output was generated
+    substantial_files = 0
+    for root, dirs, files in os.walk(output_folder):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if os.path.getsize(file_path) > 100:  # Files larger than 100 bytes
+                substantial_files += 1
+                if substantial_files >= 3:  # At least 3 substantial files
+                    logging.debug(f"Found {substantial_files} substantial files in {output_folder}")
+                    return True
     
     return False
 
@@ -359,26 +391,57 @@ def run_single_smina_job(job_data):
     process_id = os.getpid()
     
     try:
-        # Check if smina output already exists
+        # Check if smina output already exists with proper validation
         smina_output_dir = os.path.join(current_outfolder, "smina")
         if os.path.exists(smina_output_dir) and os.listdir(smina_output_dir):
-            return {
-                'success': True,
-                'job_idx': job_idx,
-                'drugbank_id': drugbank_id,
-                'uniprot_id': uniprot_id,
-                'gene_name': gene_name,
-                'pocket_pdb': pocket_pdb,
-                'current_outfolder': current_outfolder,
-                'action': 'skipped',
-                'message': 'Smina job already completed',
-                'process_id': process_id
-            }
+            # More thorough validation - check for actual docking results
+            smina_files = os.listdir(smina_output_dir)
+            has_valid_output = False
+            
+            # Look for typical smina output files
+            for file in smina_files:
+                file_path = os.path.join(smina_output_dir, file)
+                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+                    # Check for SDF files (docked poses) or other meaningful outputs
+                    if file.endswith('.sdf') or file.endswith('.pdb') or file.endswith('.mol2'):
+                        has_valid_output = True
+                        break
+                    # Check for log files that might indicate completion
+                    elif file.endswith('.log') or file.endswith('.out'):
+                        # Verify log file has meaningful content (not just empty or error)
+                        try:
+                            with open(file_path, 'r') as f:
+                                content = f.read().strip()
+                                if len(content) > 100:  # Arbitrary threshold for meaningful content
+                                    has_valid_output = True
+                                    break
+                        except:
+                            continue
+            
+            if has_valid_output:
+                return {
+                    'success': True,
+                    'job_idx': job_idx,
+                    'drugbank_id': drugbank_id,
+                    'uniprot_id': uniprot_id,
+                    'gene_name': gene_name,
+                    'pocket_pdb': pocket_pdb,
+                    'current_outfolder': current_outfolder,
+                    'action': 'skipped',
+                    'message': 'Smina job already completed with valid output',
+                    'process_id': process_id
+                }
+            else:
+                # Output directory exists but doesn't contain valid results - remove it and re-run
+                logging.warning(f"Smina output directory exists but contains no valid results. Removing: {smina_output_dir}")
+                import shutil
+                shutil.rmtree(smina_output_dir)
         
         # Build the smina-only command
         command = [
             "python", CONSENSUS_DOCKER_SCRIPT,
             "--use_smina",
+            "--overwrite",  # Allow writing to existing directory
             "--outfolder", current_outfolder,
             "--smina_path", SMINA_PATH,
             "--ligand_sdf", ligand_sdf,
@@ -491,24 +554,80 @@ def run_single_gold_ledock_job(job_data):
     process_id = os.getpid()
     
     try:
-        # Check if gold/ledock output already exists
+        # Check if gold/ledock output already exists with proper validation
         gold_output_dir = os.path.join(current_outfolder, "gold")
         ledock_output_dir = os.path.join(current_outfolder, "ledock")
         
+        # Check if both directories exist and have content
         if (os.path.exists(gold_output_dir) and os.listdir(gold_output_dir) and
             os.path.exists(ledock_output_dir) and os.listdir(ledock_output_dir)):
-            return {
-                'success': True,
-                'job_idx': job_idx,
-                'drugbank_id': drugbank_id,
-                'uniprot_id': uniprot_id,
-                'gene_name': gene_name,
-                'pocket_pdb': pocket_pdb,
-                'current_outfolder': current_outfolder,
-                'action': 'skipped',
-                'message': 'Gold/LeDock jobs already completed',
-                'process_id': process_id
-            }
+            
+            # More thorough validation - check for actual docking results
+            has_valid_gold_output = False
+            has_valid_ledock_output = False
+            
+            # Validate Gold output
+            gold_files = os.listdir(gold_output_dir)
+            for file in gold_files:
+                file_path = os.path.join(gold_output_dir, file)
+                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+                    # Check for typical Gold output files
+                    if (file.endswith('.sdf') or file.endswith('.mol2') or 
+                        file.endswith('.pdb')):
+                        has_valid_gold_output = True
+                        break
+                    elif file.endswith('.log') or file.endswith('.out'):
+                        try:
+                            with open(file_path, 'r') as f:
+                                content = f.read().strip()
+                                if len(content) > 100:  # Meaningful content threshold
+                                    has_valid_gold_output = True
+                                    break
+                        except:
+                            continue
+            
+            # Validate LeDock output
+            ledock_files = os.listdir(ledock_output_dir)
+            for file in ledock_files:
+                file_path = os.path.join(ledock_output_dir, file)
+                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+                    # Check for typical LeDock output files
+                    if (file.endswith('.sdf') or file.endswith('.dok') or 
+                        file.endswith('.pdb')):
+                        has_valid_ledock_output = True
+                        break
+                    elif file.endswith('.log') or file.endswith('.out'):
+                        try:
+                            with open(file_path, 'r') as f:
+                                content = f.read().strip()
+                                if len(content) > 100:  # Meaningful content threshold
+                                    has_valid_ledock_output = True
+                                    break
+                        except:
+                            continue
+            
+            if has_valid_gold_output and has_valid_ledock_output:
+                return {
+                    'success': True,
+                    'job_idx': job_idx,
+                    'drugbank_id': drugbank_id,
+                    'uniprot_id': uniprot_id,
+                    'gene_name': gene_name,
+                    'pocket_pdb': pocket_pdb,
+                    'current_outfolder': current_outfolder,
+                    'action': 'skipped',
+                    'message': 'Gold/LeDock jobs already completed with valid output',
+                    'process_id': process_id
+                }
+            else:
+                # Output directories exist but don't contain valid results - remove them and re-run
+                import shutil
+                if not has_valid_gold_output and os.path.exists(gold_output_dir):
+                    logging.warning(f"Gold output directory exists but contains no valid results. Removing: {gold_output_dir}")
+                    shutil.rmtree(gold_output_dir)
+                if not has_valid_ledock_output and os.path.exists(ledock_output_dir):
+                    logging.warning(f"LeDock output directory exists but contains no valid results. Removing: {ledock_output_dir}")
+                    shutil.rmtree(ledock_output_dir)
         
         # Build the gold/ledock command (write to existing directory)
         command = [
