@@ -35,14 +35,14 @@ import os
 import sys
 import pandas as pd
 import subprocess
-from tqdm import tqdm
-from pathlib import Path
 import re
 import time
 import logging
 import glob
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+from tqdm import tqdm
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # --- Configuration ---
 # --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
@@ -410,7 +410,7 @@ def run_single_smina_job(job_data):
     SMINA_PATH = job_data['smina_path']
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
-    EXHAUSTIVENESS = job_data['exhaustiveness']
+    EXHAUSTIVENESS = job_data.get('exhaustiveness', 8)  # Default to 8 if not set
     
     process_id = os.getpid()
     
@@ -541,7 +541,7 @@ def run_single_gold_job(job_data):
     GOLD_PATH = job_data['gold_path']
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
-    EXHAUSTIVENESS = job_data['exhaustiveness']
+    EXHAUSTIVENESS = job_data.get('exhaustiveness', 8)  # Default to 8 if not set
     
     process_id = os.getpid()
     
@@ -673,7 +673,7 @@ def run_single_ledock_job(job_data):
     LEPRO_PATH = job_data['lepro_path']
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
-    EXHAUSTIVENESS = job_data['exhaustiveness']
+    EXHAUSTIVENESS = job_data.get('exhaustiveness', 8)  # Default to 8 if not set
     
     process_id = os.getpid()
     
@@ -904,7 +904,7 @@ def run_single_rmsd_job(job_data):
 
 # --- Part 3: Main Docking Execution Logic ---
 
-def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout):
+def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout, exhaustiveness=None):
     """
     Run a stage of docking jobs in parallel.
     
@@ -920,6 +920,8 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
         Maximum number of parallel workers
     timeout : int
         Timeout for each job in seconds
+    exhaustiveness : int, optional
+        Exhaustiveness parameter for the docking tool
         
     Returns
     -------
@@ -929,6 +931,8 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
     logging.info(f"\n=== {stage_name.upper()} ===")
     logging.info(f"Starting {stage_name} with {max_workers} processes...")
     logging.info(f"Timeout per job: {timeout/60:.1f} minutes")
+    if exhaustiveness is not None:
+        logging.info(f"Exhaustiveness: {exhaustiveness}")
     
     stage_start_time = time.time()
     completed_jobs = 0
@@ -939,11 +943,16 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
     last_progress_log = time.time()
     progress_log_interval = 30  # Log progress every 30 seconds
     
-    # Update job data with correct timeout
+    # Update job data with correct timeout and exhaustiveness
     stage_job_data_list = []
     for job_data in job_data_list:
         stage_job_data = job_data.copy()
         stage_job_data['timeout'] = timeout
+        if exhaustiveness is not None:
+            stage_job_data['exhaustiveness'] = exhaustiveness
+            logging.debug(f"Setting exhaustiveness to {exhaustiveness} for job {stage_job_data.get('job_idx', 'unknown')}")
+        else:
+            logging.debug(f"No exhaustiveness set for job {stage_job_data.get('job_idx', 'unknown')}")
         stage_job_data_list.append(stage_job_data)
     
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -1203,29 +1212,32 @@ def run_docking(
     
     # === STAGE 1: RUN SMINA DOCKING ===
     stage1_stats = run_stage_jobs(
-        job_data_list, 
-        "Stage 1: Smina Docking", 
-        run_single_smina_job,
-        SMINA_MAX_PARALLEL_JOBS,
-        SMINA_TIMEOUT
+        job_data_list=job_data_list, 
+        stage_name="Stage 1: Smina Docking", 
+        job_function=run_single_smina_job,
+        max_workers=SMINA_MAX_PARALLEL_JOBS,
+        timeout=SMINA_TIMEOUT,
+        exhaustiveness=SMINA_EXHAUSTIVENESS
     )
     
     # === STAGE 2: RUN GOLD DOCKING ===
     stage2_stats = run_stage_jobs(
-        job_data_list, 
-        "Stage 2: Gold Docking", 
-        run_single_gold_job,
-        GOLD_MAX_PARALLEL_JOBS,
-        GOLD_TIMEOUT
+        job_data_list=job_data_list, 
+        stage_name="Stage 2: Gold Docking", 
+        job_function=run_single_gold_job,
+        max_workers=GOLD_MAX_PARALLEL_JOBS,
+        timeout=GOLD_TIMEOUT,
+        exhaustiveness=GOLD_EXHAUSTIVENESS
     )
     
     # === STAGE 3: RUN LEDOCK DOCKING ===
     stage3_stats = run_stage_jobs(
-        job_data_list, 
-        "Stage 3: LeDock Docking", 
-        run_single_ledock_job,
-        LEDOCK_MAX_PARALLEL_JOBS,
-        LEDOCK_TIMEOUT
+        job_data_list=job_data_list, 
+        stage_name="Stage 3: LeDock Docking", 
+        job_function=run_single_ledock_job,
+        max_workers=LEDOCK_MAX_PARALLEL_JOBS,
+        timeout=LEDOCK_TIMEOUT,
+        exhaustiveness=LEDOCK_EXHAUSTIVENESS
     )
     
     # === STAGE 4: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
@@ -1240,11 +1252,11 @@ def run_docking(
     if rmsd_jobs:
         logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
         stage4_stats = run_stage_jobs(
-            rmsd_jobs, 
-            "Stage 4: RMSD Calculation", 
-            run_single_rmsd_job,
-            RMSD_MAX_PARALLEL_JOBS,
-            RMSD_TIMEOUT
+            job_data_list=rmsd_jobs, 
+            stage_name="Stage 4: RMSD Calculation", 
+            job_function=run_single_rmsd_job,
+            max_workers=RMSD_MAX_PARALLEL_JOBS,
+            timeout=RMSD_TIMEOUT
         )
     else:
         logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
