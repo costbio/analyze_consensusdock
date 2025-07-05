@@ -61,15 +61,22 @@ TEST_MODE = False
 MAX_TEST_JOBS = 40
 # --- CONFIRMATION PROMPT: Set to True to skip user confirmation when not in TEST_MODE ---
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
-# --- TWO-STAGE DOCKING CONFIGURATION ---
+# --- THREE-STAGE DOCKING CONFIGURATION ---
 # Stage 1: Smina only (high exhaustiveness, low parallelism)
 SMINA_MAX_PARALLEL_JOBS = 4     # Maximum parallel jobs for smina stage
 SMINA_EXHAUSTIVENESS = 16       # High exhaustiveness for smina
 SMINA_TIMEOUT = 300           # Timeout for smina jobs in seconds (5 minutes)
-# Stage 2: Gold + LeDock (high parallelism, standard exhaustiveness)
-GOLD_LEDOCK_MAX_PARALLEL_JOBS = 60  # Maximum parallel jobs for gold+ledock stage
-GOLD_LEDOCK_EXHAUSTIVENESS = 12     # Standard exhaustiveness for gold+ledock
-GOLD_LEDOCK_TIMEOUT = 600           # Timeout for gold+ledock jobs in seconds (10 minutes)
+# Stage 2: Gold (medium parallelism, standard exhaustiveness)
+GOLD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for gold stage
+GOLD_EXHAUSTIVENESS = 12        # Standard exhaustiveness for gold
+GOLD_TIMEOUT = 600              # Timeout for gold jobs in seconds (10 minutes)
+# Stage 3: LeDock (high parallelism, standard exhaustiveness)
+LEDOCK_MAX_PARALLEL_JOBS = 60   # Maximum parallel jobs for ledock stage
+LEDOCK_EXHAUSTIVENESS = 12      # Standard exhaustiveness for ledock
+LEDOCK_TIMEOUT = 600            # Timeout for ledock jobs in seconds (10 minutes)
+# Stage 4: RMSD calculation (if all tools completed but final results missing)
+RMSD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for RMSD calculation
+RMSD_TIMEOUT = 300              # Timeout for RMSD calculation in seconds (5 minutes)
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
@@ -94,9 +101,11 @@ else:
     logging.info("*** RUNNING IN PRODUCTION MODE ***")
 if SKIP_CONFIRMATION:
     logging.info("*** SKIP_CONFIRMATION ENABLED - NO USER PROMPT REQUIRED ***")
-logging.info(f"*** TWO-STAGE PARALLEL EXECUTION ENABLED ***")
+logging.info(f"*** THREE-STAGE PARALLEL EXECUTION ENABLED ***")
 logging.info(f"*** STAGE 1: SMINA - UP TO {SMINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {SMINA_EXHAUSTIVENESS}, TIMEOUT {SMINA_TIMEOUT/60:.1f} MINUTES ***")
-logging.info(f"*** STAGE 2: GOLD/LEDOCK - UP TO {GOLD_LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {GOLD_LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
+logging.info(f"*** STAGE 2: GOLD - UP TO {GOLD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GOLD_EXHAUSTIVENESS}, TIMEOUT {GOLD_TIMEOUT/60:.1f} MINUTES ***")
+logging.info(f"*** STAGE 3: LEDOCK - UP TO {LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {LEDOCK_EXHAUSTIVENESS}, TIMEOUT {LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
+logging.info(f"*** STAGE 4: RMSD CALCULATION - UP TO {RMSD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {RMSD_TIMEOUT/60:.1f} MINUTES ***")
 logging.info(f"Consensus Docker Script: {CONSENSUS_DOCKER_SCRIPT}")
 logging.info(f"Processed Ligand SDF Folder: {PROCESSED_LIGAND_SDF_FOLDER}")
 logging.info(f"Drug-to-Protein TSV: {DRUG_TO_PROTEIN_TSV}")
@@ -280,85 +289,100 @@ def load_cavity_mapping(mapping_file, pdbqt_mapping_file=None):
         logging.critical(f"Error loading cavity mapping file: {e}")
         sys.exit(1)
 
-def check_docking_completion(output_folder):
+def check_tool_completion(output_folder, tool_name):
     """
-    Check if a docking job was completed successfully by examining the output folder.
+    Check if a specific docking tool has completed successfully.
+    
+    Args:
+        output_folder (str): Path to the docking output folder
+        tool_name (str): Name of the tool ('smina', 'gold', 'ledock')
+        
+    Returns:
+        bool: True if the tool has completed with valid results, False otherwise
+    """
+    if not os.path.exists(output_folder):
+        return False
+    
+    # Check for tool-specific results file
+    results_file = os.path.join(output_folder, tool_name, "results.csv")
+    if os.path.exists(results_file) and os.path.getsize(results_file) > 100:
+        return True
+    
+    # Check for tool-specific output directory with valid files
+    tool_output_dir = os.path.join(output_folder, tool_name)
+    if not os.path.exists(tool_output_dir) or not os.listdir(tool_output_dir):
+        return False
+    
+    # Look for valid output files specific to each tool
+    valid_files = 0
+    for file in os.listdir(tool_output_dir):
+        file_path = os.path.join(tool_output_dir, file)
+        if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
+            continue
+            
+        # Tool-specific validation
+        if tool_name == "smina":
+            if file.endswith(('.sdf', '.pdb', '.mol2', '.log')):
+                valid_files += 1
+        elif tool_name == "gold":
+            if file.endswith(('.sdf', '.mol2', '.pdb', '.log')):
+                valid_files += 1
+        elif tool_name == "ledock":
+            if file.endswith(('.sdf', '.dok', '.pdb', '.log')):
+                valid_files += 1
+    
+    return valid_files > 0
+
+def check_final_results_completion(output_folder):
+    """
+    Check if final consensus results with RMSD calculations are complete.
     
     Args:
         output_folder (str): Path to the docking output folder
         
     Returns:
-        bool: True if the job appears to be completed with valid output, False otherwise
+        bool: True if final results are complete, False otherwise
     """
     if not os.path.exists(output_folder):
         return False
     
-    # Check if the folder has any content
-    if not os.listdir(output_folder):
-        return False
-    
-    # Look for typical consensus docking output files with size validation
-    success_indicators = [
-        ("consensus_results.csv", 100),  # (pattern, minimum_size_bytes)
-        ("consensus_scores.txt", 50), 
-        ("docking_summary.log", 100),
-        ("*.sdf", 1000),  # SDF files should be reasonably large
-        ("*.pdb", 500),   # PDB files should have meaningful content
-        ("*.mol2", 500),  # MOL2 files should have meaningful content
-        ("*/results.txt", 50)  # Results in subdirectories
-    ]
-    
-    valid_files_found = 0
-    
-    for pattern, min_size in success_indicators:
-        matching_files = glob.glob(os.path.join(output_folder, pattern))
-        for file_path in matching_files:
-            if os.path.isfile(file_path) and os.path.getsize(file_path) >= min_size:
-                logging.debug(f"Found valid completion indicator: {file_path} ({os.path.getsize(file_path)} bytes)")
-                valid_files_found += 1
-                if valid_files_found >= 2:  # Require at least 2 valid files for confidence
+    # Check for final results file with RMSD data
+    final_results_file = os.path.join(output_folder, "final_results.csv")
+    if os.path.exists(final_results_file) and os.path.getsize(final_results_file) > 200:
+        # Verify that the file contains RMSD data
+        try:
+            with open(final_results_file, 'r') as f:
+                header = f.readline().strip()
+                if 'rmsd' in header.lower() or 'consensus' in header.lower():
                     return True
-    
-    # Additional check: look for subdirectories with valid docking results
-    subdirs = ['smina', 'gold', 'ledock']
-    valid_subdirs = 0
-    
-    for subdir in subdirs:
-        subdir_path = os.path.join(output_folder, subdir)
-        if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
-            subdir_files = os.listdir(subdir_path)
-            for file in subdir_files:
-                file_path = os.path.join(subdir_path, file)
-                if (os.path.isfile(file_path) and os.path.getsize(file_path) > 0 and
-                    (file.endswith('.sdf') or file.endswith('.pdb') or file.endswith('.mol2'))):
-                    valid_subdirs += 1
-                    logging.debug(f"Found valid output in {subdir}: {file}")
-                    break
-    
-    # If we have at least 2 valid subdirectories with output, consider it complete
-    if valid_subdirs >= 2:
-        return True
-    
-    # Final fallback: check if there are multiple substantial files
-    # indicating some meaningful output was generated
-    substantial_files = 0
-    for root, dirs, files in os.walk(output_folder):
-        for file in files:
-            file_path = os.path.join(root, file)
-            if os.path.getsize(file_path) > 100:  # Files larger than 100 bytes
-                substantial_files += 1
-                if substantial_files >= 3:  # At least 3 substantial files
-                    logging.debug(f"Found {substantial_files} substantial files in {output_folder}")
-                    return True
+        except:
+            pass
     
     return False
+
+def get_job_completion_status(output_folder):
+    """
+    Get the completion status of all docking tools and final results.
+    
+    Args:
+        output_folder (str): Path to the docking output folder
+        
+    Returns:
+        dict: Dictionary with completion status for each tool and final results
+    """
+    return {
+        'smina': check_tool_completion(output_folder, 'smina'),
+        'gold': check_tool_completion(output_folder, 'gold'),
+        'ledock': check_tool_completion(output_folder, 'ledock'),
+        'final_results': check_final_results_completion(output_folder)
+    }
 
 # --- NOTE: Cavity extraction is now handled by extract_cavities.py ---
 # Run extract_cavities.py first to generate cavity_mapping.csv before running this script
 
 def run_single_smina_job(job_data):
     """
-    Run a single smina docking job - Stage 1 of two-stage docking.
+    Run a single smina docking job - Stage 1 of three-stage docking.
     
     Parameters
     ----------
@@ -391,51 +415,20 @@ def run_single_smina_job(job_data):
     process_id = os.getpid()
     
     try:
-        # Check if smina output already exists with proper validation
-        smina_output_dir = os.path.join(current_outfolder, "smina")
-        if os.path.exists(smina_output_dir) and os.listdir(smina_output_dir):
-            # More thorough validation - check for actual docking results
-            smina_files = os.listdir(smina_output_dir)
-            has_valid_output = False
-            
-            # Look for typical smina output files
-            for file in smina_files:
-                file_path = os.path.join(smina_output_dir, file)
-                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                    # Check for SDF files (docked poses) or other meaningful outputs
-                    if file.endswith('.sdf') or file.endswith('.pdb') or file.endswith('.mol2'):
-                        has_valid_output = True
-                        break
-                    # Check for log files that might indicate completion
-                    elif file.endswith('.log') or file.endswith('.out'):
-                        # Verify log file has meaningful content (not just empty or error)
-                        try:
-                            with open(file_path, 'r') as f:
-                                content = f.read().strip()
-                                if len(content) > 100:  # Arbitrary threshold for meaningful content
-                                    has_valid_output = True
-                                    break
-                        except:
-                            continue
-            
-            if has_valid_output:
-                return {
-                    'success': True,
-                    'job_idx': job_idx,
-                    'drugbank_id': drugbank_id,
-                    'uniprot_id': uniprot_id,
-                    'gene_name': gene_name,
-                    'pocket_pdb': pocket_pdb,
-                    'current_outfolder': current_outfolder,
-                    'action': 'skipped',
-                    'message': 'Smina job already completed with valid output',
-                    'process_id': process_id
-                }
-            else:
-                # Output directory exists but doesn't contain valid results - remove it and re-run
-                logging.warning(f"Smina output directory exists but contains no valid results. Removing: {smina_output_dir}")
-                import shutil
-                shutil.rmtree(smina_output_dir)
+        # Check if smina output already exists
+        if check_tool_completion(current_outfolder, 'smina'):
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'skipped',
+                'message': 'Smina job already completed with valid output',
+                'process_id': process_id
+            }
         
         # Build the smina-only command
         command = [
@@ -518,9 +511,9 @@ def run_single_smina_job(job_data):
             'process_id': process_id
         }
 
-def run_single_gold_ledock_job(job_data):
+def run_single_gold_job(job_data):
     """
-    Run a single gold/ledock docking job - Stage 2 of two-stage docking.
+    Run a single gold docking job - Stage 2 of three-stage docking.
     
     Parameters
     ----------
@@ -530,7 +523,7 @@ def run_single_gold_ledock_job(job_data):
     Returns
     -------
     dict
-        Results of the gold/ledock docking job
+        Results of the gold docking job
     """
     # Extract job parameters
     job_idx = job_data['job_idx']
@@ -545,105 +538,42 @@ def run_single_gold_ledock_job(job_data):
     
     # Get configuration from job_data
     CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
-    LEDOCK_PATH = job_data['ledock_path']
-    LEPRO_PATH = job_data['lepro_path']
     GOLD_PATH = job_data['gold_path']
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
+    EXHAUSTIVENESS = job_data['exhaustiveness']
     
     process_id = os.getpid()
     
     try:
-        # Check if gold/ledock output already exists with proper validation
-        gold_output_dir = os.path.join(current_outfolder, "gold")
-        ledock_output_dir = os.path.join(current_outfolder, "ledock")
+        # Check if gold output already exists
+        if check_tool_completion(current_outfolder, 'gold'):
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'skipped',
+                'message': 'Gold job already completed with valid output',
+                'process_id': process_id
+            }
         
-        # Check if both directories exist and have content
-        if (os.path.exists(gold_output_dir) and os.listdir(gold_output_dir) and
-            os.path.exists(ledock_output_dir) and os.listdir(ledock_output_dir)):
-            
-            # More thorough validation - check for actual docking results
-            has_valid_gold_output = False
-            has_valid_ledock_output = False
-            
-            # Validate Gold output
-            gold_files = os.listdir(gold_output_dir)
-            for file in gold_files:
-                file_path = os.path.join(gold_output_dir, file)
-                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                    # Check for typical Gold output files
-                    if (file.endswith('.sdf') or file.endswith('.mol2') or 
-                        file.endswith('.pdb')):
-                        has_valid_gold_output = True
-                        break
-                    elif file.endswith('.log') or file.endswith('.out'):
-                        try:
-                            with open(file_path, 'r') as f:
-                                content = f.read().strip()
-                                if len(content) > 100:  # Meaningful content threshold
-                                    has_valid_gold_output = True
-                                    break
-                        except:
-                            continue
-            
-            # Validate LeDock output
-            ledock_files = os.listdir(ledock_output_dir)
-            for file in ledock_files:
-                file_path = os.path.join(ledock_output_dir, file)
-                if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                    # Check for typical LeDock output files
-                    if (file.endswith('.sdf') or file.endswith('.dok') or 
-                        file.endswith('.pdb')):
-                        has_valid_ledock_output = True
-                        break
-                    elif file.endswith('.log') or file.endswith('.out'):
-                        try:
-                            with open(file_path, 'r') as f:
-                                content = f.read().strip()
-                                if len(content) > 100:  # Meaningful content threshold
-                                    has_valid_ledock_output = True
-                                    break
-                        except:
-                            continue
-            
-            if has_valid_gold_output and has_valid_ledock_output:
-                return {
-                    'success': True,
-                    'job_idx': job_idx,
-                    'drugbank_id': drugbank_id,
-                    'uniprot_id': uniprot_id,
-                    'gene_name': gene_name,
-                    'pocket_pdb': pocket_pdb,
-                    'current_outfolder': current_outfolder,
-                    'action': 'skipped',
-                    'message': 'Gold/LeDock jobs already completed with valid output',
-                    'process_id': process_id
-                }
-            else:
-                # Output directories exist but don't contain valid results - remove them and re-run
-                import shutil
-                if not has_valid_gold_output and os.path.exists(gold_output_dir):
-                    logging.warning(f"Gold output directory exists but contains no valid results. Removing: {gold_output_dir}")
-                    shutil.rmtree(gold_output_dir)
-                if not has_valid_ledock_output and os.path.exists(ledock_output_dir):
-                    logging.warning(f"LeDock output directory exists but contains no valid results. Removing: {ledock_output_dir}")
-                    shutil.rmtree(ledock_output_dir)
-        
-        # Build the gold/ledock command (write to existing directory)
+        # Build the gold-only command
         command = [
             "python", CONSENSUS_DOCKER_SCRIPT,
             "--use_gold",
-            "--use_ledock",
             "--overwrite",  # Allow writing to existing directory
             "--outfolder", current_outfolder,
-            "--ledock_path", LEDOCK_PATH,
-            "--lepro_path", LEPRO_PATH,
             "--gold_path", GOLD_PATH,
             "--ligand_sdf", ligand_sdf,
             "--receptor_pdb", receptor_pdb,
             "--pocket_pdb", pocket_pdb,
             "--num_threads", str(NUM_THREADS),
-            "--cutoff_value", str(CUTOFF_VALUE)
+            "--cutoff_value", str(CUTOFF_VALUE),
+            "--exhaustiveness", str(EXHAUSTIVENESS)
         ]
         
         # Add PDBQT file if available for faster processing
@@ -665,7 +595,7 @@ def run_single_gold_ledock_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'timeout',
-                'message': f'Gold/LeDock docking timed out after {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)',
+                'message': f'Gold docking timed out after {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)',
                 'process_id': process_id
             }
         
@@ -679,7 +609,7 @@ def run_single_gold_ledock_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'completed',
-                'message': f'Successfully completed gold/ledock docking for {drugbank_id} into {pocket_pdb}',
+                'message': f'Successfully completed gold docking for {drugbank_id} into {pocket_pdb}',
                 'process_id': process_id
             }
         else:
@@ -692,7 +622,7 @@ def run_single_gold_ledock_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'failed',
-                'message': f'Gold/LeDock docking failed. Return code: {result.returncode}',
+                'message': f'Gold docking failed. Return code: {result.returncode}',
                 'stdout': result.stdout,
                 'stderr': result.stderr,
                 'process_id': process_id
@@ -708,11 +638,400 @@ def run_single_gold_ledock_job(job_data):
             'pocket_pdb': pocket_pdb,
             'current_outfolder': current_outfolder,
             'action': 'error',
-            'message': f'Exception occurred in gold/ledock docking: {str(e)}',
+            'message': f'Exception occurred in gold docking: {str(e)}',
+            'process_id': process_id
+        }
+
+def run_single_ledock_job(job_data):
+    """
+    Run a single ledock docking job - Stage 3 of three-stage docking.
+    
+    Parameters
+    ----------
+    job_data : dict
+        Dictionary containing all job parameters
+        
+    Returns
+    -------
+    dict
+        Results of the ledock docking job
+    """
+    # Extract job parameters
+    job_idx = job_data['job_idx']
+    drugbank_id = job_data['drugbank_id']
+    uniprot_id = job_data['uniprot_id']
+    gene_name = job_data['gene_name']
+    ligand_sdf = job_data['ligand_sdf']
+    receptor_pdb = job_data['receptor_pdb']
+    receptor_pdbqt = job_data['receptor_pdbqt']
+    pocket_pdb = job_data['pocket_pdb']
+    current_outfolder = job_data['current_outfolder']
+    
+    # Get configuration from job_data
+    CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
+    LEDOCK_PATH = job_data['ledock_path']
+    LEPRO_PATH = job_data['lepro_path']
+    NUM_THREADS = job_data['num_threads']
+    CUTOFF_VALUE = job_data['cutoff_value']
+    EXHAUSTIVENESS = job_data['exhaustiveness']
+    
+    process_id = os.getpid()
+    
+    try:
+        # Check if ledock output already exists
+        if check_tool_completion(current_outfolder, 'ledock'):
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'skipped',
+                'message': 'LeDock job already completed with valid output',
+                'process_id': process_id
+            }
+        
+        # Build the ledock-only command
+        command = [
+            "python", CONSENSUS_DOCKER_SCRIPT,
+            "--use_ledock",
+            "--overwrite",  # Allow writing to existing directory
+            "--outfolder", current_outfolder,
+            "--ledock_path", LEDOCK_PATH,
+            "--lepro_path", LEPRO_PATH,
+            "--ligand_sdf", ligand_sdf,
+            "--receptor_pdb", receptor_pdb,
+            "--pocket_pdb", pocket_pdb,
+            "--num_threads", str(NUM_THREADS),
+            "--cutoff_value", str(CUTOFF_VALUE),
+            "--exhaustiveness", str(EXHAUSTIVENESS)
+        ]
+        
+        # Add PDBQT file if available for faster processing
+        if receptor_pdbqt and os.path.exists(receptor_pdbqt):
+            command.extend(["--receptor_pdbqt", receptor_pdbqt])
+        
+        # Run the command with timeout
+        timeout_seconds = job_data.get('timeout', 600)  # Default 10 minutes
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, 
+                                  check=False, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'timeout',
+                'message': f'LeDock docking timed out after {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)',
+                'process_id': process_id
+            }
+        
+        if result.returncode == 0:
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'completed',
+                'message': f'Successfully completed ledock docking for {drugbank_id} into {pocket_pdb}',
+                'process_id': process_id
+            }
+        else:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'failed',
+                'message': f'LeDock docking failed. Return code: {result.returncode}',
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'process_id': process_id
+            }
+    
+    except Exception as e:
+        return {
+            'success': False,
+            'job_idx': job_idx,
+            'drugbank_id': drugbank_id,
+            'uniprot_id': uniprot_id,
+            'gene_name': gene_name,
+            'pocket_pdb': pocket_pdb,
+            'current_outfolder': current_outfolder,
+            'action': 'error',
+            'message': f'Exception occurred in ledock docking: {str(e)}',
+            'process_id': process_id
+        }
+
+def run_single_rmsd_job(job_data):
+    """
+    Run RMSD calculation for a job where all tools completed but final results are missing.
+    
+    Parameters
+    ----------
+    job_data : dict
+        Dictionary containing all job parameters
+        
+    Returns
+    -------
+    dict
+        Results of the RMSD calculation
+    """
+    # Extract job parameters
+    job_idx = job_data['job_idx']
+    drugbank_id = job_data['drugbank_id']
+    uniprot_id = job_data['uniprot_id']
+    gene_name = job_data['gene_name']
+    ligand_sdf = job_data['ligand_sdf']
+    receptor_pdb = job_data['receptor_pdb']
+    receptor_pdbqt = job_data['receptor_pdbqt']
+    pocket_pdb = job_data['pocket_pdb']
+    current_outfolder = job_data['current_outfolder']
+    
+    # Get configuration from job_data
+    CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
+    NUM_THREADS = job_data['num_threads']
+    CUTOFF_VALUE = job_data['cutoff_value']
+    
+    process_id = os.getpid()
+    
+    try:
+        # Check if final results already exist
+        if check_final_results_completion(current_outfolder):
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'skipped',
+                'message': 'Final results already completed with valid RMSD data',
+                'process_id': process_id
+            }
+        
+        # Build the RMSD-only command (run consensus docker with skip flags to only calculate RMSD)
+        command = [
+            "python", CONSENSUS_DOCKER_SCRIPT,
+            "--skip_docking",  # Skip actual docking, only calculate RMSD
+            "--overwrite",  # Allow writing to existing directory
+            "--outfolder", current_outfolder,
+            "--ligand_sdf", ligand_sdf,
+            "--receptor_pdb", receptor_pdb,
+            "--pocket_pdb", pocket_pdb,
+            "--num_threads", str(NUM_THREADS),
+            "--cutoff_value", str(CUTOFF_VALUE)
+        ]
+        
+        # Add PDBQT file if available
+        if receptor_pdbqt and os.path.exists(receptor_pdbqt):
+            command.extend(["--receptor_pdbqt", receptor_pdbqt])
+        
+        # Run the command with timeout
+        timeout_seconds = job_data.get('timeout', 300)  # Default 5 minutes
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, 
+                                  check=False, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'timeout',
+                'message': f'RMSD calculation timed out after {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)',
+                'process_id': process_id
+            }
+        
+        if result.returncode == 0:
+            return {
+                'success': True,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'completed',
+                'message': f'Successfully completed RMSD calculation for {drugbank_id} into {pocket_pdb}',
+                'process_id': process_id
+            }
+        else:
+            return {
+                'success': False,
+                'job_idx': job_idx,
+                'drugbank_id': drugbank_id,
+                'uniprot_id': uniprot_id,
+                'gene_name': gene_name,
+                'pocket_pdb': pocket_pdb,
+                'current_outfolder': current_outfolder,
+                'action': 'failed',
+                'message': f'RMSD calculation failed. Return code: {result.returncode}',
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'process_id': process_id
+            }
+    
+    except Exception as e:
+        return {
+            'success': False,
+            'job_idx': job_idx,
+            'drugbank_id': drugbank_id,
+            'uniprot_id': uniprot_id,
+            'gene_name': gene_name,
+            'pocket_pdb': pocket_pdb,
+            'current_outfolder': current_outfolder,
+            'action': 'error',
+            'message': f'Exception occurred in RMSD calculation: {str(e)}',
             'process_id': process_id
         }
 
 # --- Part 3: Main Docking Execution Logic ---
+
+def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout):
+    """
+    Run a stage of docking jobs in parallel.
+    
+    Parameters
+    ----------
+    job_data_list : list
+        List of job data dictionaries
+    stage_name : str
+        Name of the stage (for logging)
+    job_function : callable
+        Function to run each job
+    max_workers : int
+        Maximum number of parallel workers
+    timeout : int
+        Timeout for each job in seconds
+        
+    Returns
+    -------
+    dict
+        Statistics about the stage execution
+    """
+    logging.info(f"\n=== {stage_name.upper()} ===")
+    logging.info(f"Starting {stage_name} with {max_workers} processes...")
+    logging.info(f"Timeout per job: {timeout/60:.1f} minutes")
+    
+    stage_start_time = time.time()
+    completed_jobs = 0
+    failed_jobs = 0
+    timeout_jobs = 0
+    skipped_jobs = 0
+    unique_processes = set()
+    last_progress_log = time.time()
+    progress_log_interval = 30  # Log progress every 30 seconds
+    
+    # Update job data with correct timeout
+    stage_job_data_list = []
+    for job_data in job_data_list:
+        stage_job_data = job_data.copy()
+        stage_job_data['timeout'] = timeout
+        stage_job_data_list.append(stage_job_data)
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all jobs
+        future_to_job = {executor.submit(job_function, job_data): job_data for job_data in stage_job_data_list}
+        
+        # Process results with progress bar
+        completed_futures = 0
+        for future in tqdm(as_completed(future_to_job), total=len(stage_job_data_list), 
+                         desc=f"{stage_name}", unit="job"):
+            try:
+                result = future.result()
+                completed_futures += 1
+                
+                # Track unique processes
+                if 'process_id' in result:
+                    unique_processes.add(result['process_id'])
+                
+                if result['success']:
+                    if result['action'] == 'completed':
+                        completed_jobs += 1
+                        logging.info(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                    elif result['action'] == 'skipped':
+                        skipped_jobs += 1
+                        logging.debug(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                else:
+                    if result['action'] == 'timeout':
+                        timeout_jobs += 1
+                        logging.warning(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                    else:
+                        failed_jobs += 1
+                        logging.error(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                        if 'stdout' in result and result['stdout']:
+                            logging.error(f"STDOUT: {result['stdout']}")
+                        if 'stderr' in result and result['stderr']:
+                            logging.error(f"STDERR: {result['stderr']}")
+                
+                # Log progress periodically
+                current_time = time.time()
+                if current_time - last_progress_log >= progress_log_interval:
+                    percent_complete = (completed_futures / len(stage_job_data_list)) * 100
+                    elapsed_time = current_time - stage_start_time
+                    avg_time_per_job = elapsed_time / completed_futures if completed_futures > 0 else 0
+                    remaining_jobs = len(stage_job_data_list) - completed_futures
+                    estimated_time_remaining = remaining_jobs * avg_time_per_job
+                    
+                    # Format elapsed time and ETA
+                    def format_time(seconds):
+                        if seconds < 60:
+                            return f"{seconds:.0f}s"
+                        elif seconds < 3600:
+                            return f"{seconds/60:.1f}m"
+                        else:
+                            return f"{seconds/3600:.1f}h"
+                    
+                    elapsed_str = format_time(elapsed_time)
+                    eta_str = format_time(estimated_time_remaining) if estimated_time_remaining > 0 else "N/A"
+                    
+                    logging.info(f"{stage_name.upper()} PROGRESS: {percent_complete:.1f}% complete "
+                               f"({completed_futures}/{len(stage_job_data_list)} jobs processed) | "
+                               f"✓{completed_jobs} completed, ✗{failed_jobs} failed, ⏱{timeout_jobs} timeout, ◊{skipped_jobs} skipped | "
+                               f"Elapsed: {elapsed_str}, ETA: {eta_str}")
+                    last_progress_log = current_time
+                        
+            except Exception as e:
+                failed_jobs += 1
+                completed_futures += 1
+                job_data = future_to_job[future]
+                logging.error(f"Exception in {stage_name} job {job_data['job_idx']+1}: {e}")
+    
+    # Stage summary
+    stage_elapsed_time = time.time() - stage_start_time
+    logging.info(f"\n=== {stage_name.upper()} COMPLETED ===")
+    logging.info(f"{stage_name} jobs completed successfully: {completed_jobs}")
+    logging.info(f"{stage_name} jobs skipped (already completed): {skipped_jobs}")
+    logging.info(f"{stage_name} jobs failed: {failed_jobs}")
+    logging.info(f"{stage_name} jobs timed out: {timeout_jobs}")
+    logging.info(f"{stage_name} execution time: {stage_elapsed_time:.2f} seconds")
+    logging.info(f"Used {len(unique_processes)} unique processes out of {max_workers} configured")
+    
+    return {
+        'completed': completed_jobs,
+        'skipped': skipped_jobs,
+        'failed': failed_jobs,
+        'timeout': timeout_jobs,
+        'elapsed_time': stage_elapsed_time,
+        'unique_processes': len(unique_processes)
+    }
 
 def run_docking(
     drug_to_protein_df, 
@@ -722,9 +1041,9 @@ def run_docking(
     output_base_folder="docking_results"
 ):
     """
-    Iterates through drug-protein pairs, constructs commands, and runs docking.
+    Iterates through drug-protein pairs, constructs commands, and runs three-stage docking.
     """
-    logging.info("Starting docking execution.")
+    logging.info("Starting three-stage docking execution.")
     total_docking_jobs = 0
     executed_docking_jobs = 0
     skipped_jobs = 0
@@ -741,7 +1060,7 @@ def run_docking(
     sample_uniprot_ids = [uniprot_gene_map[gene] for gene in sample_gene_names]
     logging.info(f"Corresponding UniProt IDs: {sample_uniprot_ids}")
 
-    docking_jobs = [] # List to store (drugbank_id, uniprot_id, receptor_pdb, pocket_pdb) tuples
+    docking_jobs = [] # List to store job dictionaries
 
     logging.info("Preparing list of docking jobs...")
     for index, row in tqdm(drug_to_protein_df.iterrows(), total=len(drug_to_protein_df), desc="Preparing Jobs"):
@@ -761,27 +1080,14 @@ def run_docking(
             continue
         
         if uniprot_id not in pdb_info_dict:
-            # Enhanced debugging for missing UniProt IDs
             logging.debug(f"UniProt ID '{uniprot_id}' not found in cavity mapping. Gene: '{gene_name}', DrugBank: '{drugbank_id}'")
-            
-            # Check if it's a case sensitivity issue or extra whitespace
-            matching_keys = [key for key in pdb_info_dict.keys() if uniprot_id.upper() == key.upper()]
-            if matching_keys:
-                logging.warning(f"Found case-insensitive match for '{uniprot_id}': {matching_keys[0]}. Consider fixing data consistency.")
-            else:
-                # Show some nearby keys for debugging
-                all_keys = list(pdb_info_dict.keys())
-                if all_keys:
-                    nearby_keys = all_keys[:5]  # Show first 5 keys
-                    logging.debug(f"Available UniProt IDs (first 5): {nearby_keys}")
-            
             tqdm.write(f"Warning: No PDB information found for UniProt ID '{uniprot_id}'. Skipping {drugbank_id}-{gene_name} pair.")
             skipped_jobs += 1
             continue
 
         # Each UniProt ID can have multiple pocket/receptor pairs
         for receptor_pdb, pocket_pdb, receptor_pdbqt in pdb_info_dict[uniprot_id]:
-            # Create unique job identifier to detect duplicates
+            # Create unique job identifier
             pocket_filename = Path(pocket_pdb).stem
             cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
             cavity_num = cavity_match.group(1) if cavity_match else "unknown"
@@ -838,14 +1144,13 @@ def run_docking(
         if docking_jobs:
             preview_df = preview_docking_jobs(docking_jobs, "docking_jobs_preview_test_mode.csv")
 
-    # Preview docking jobs and save to CSV
-    preview_file = "docking_jobs_preview.csv"
-    preview_df = preview_docking_jobs(docking_jobs, preview_file)
-    
-    # Prepare job data for two-stage multiprocessing
-    logging.info(f"Preparing {len(docking_jobs)} jobs for two-stage parallel execution...")
+    # Prepare job data for three-stage multiprocessing
+    logging.info(f"Preparing {len(docking_jobs)} jobs for three-stage parallel execution...")
     logging.info(f"Stage 1: Smina with {SMINA_MAX_PARALLEL_JOBS} processes, exhaustiveness {SMINA_EXHAUSTIVENESS}")
-    logging.info(f"Stage 2: Gold/LeDock with {GOLD_LEDOCK_MAX_PARALLEL_JOBS} processes")
+    logging.info(f"Stage 2: Gold with {GOLD_MAX_PARALLEL_JOBS} processes, exhaustiveness {GOLD_EXHAUSTIVENESS}")
+    logging.info(f"Stage 3: LeDock with {LEDOCK_MAX_PARALLEL_JOBS} processes, exhaustiveness {LEDOCK_EXHAUSTIVENESS}")
+    logging.info(f"Stage 4: RMSD with {RMSD_MAX_PARALLEL_JOBS} processes")
+    
     job_data_list = []
     
     for job_idx, job in enumerate(docking_jobs):
@@ -863,9 +1168,8 @@ def run_docking(
         cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
         cavity_num = cavity_match.group(1) if cavity_match else "unknown"
         
-        # Create a cleaner suffix by removing AF prefix and keeping cavity info
+        # Create a cleaner suffix
         pocket_suffix = re.sub(r'AF-[A-Z0-9]+(?:-F1-model_v1_)?', '', pocket_filename)
-        # If the suffix is too long or complex, use a simpler naming scheme
         if len(pocket_suffix) > 50:  # Arbitrary length limit
             pocket_suffix = f"cavity_{cavity_num}"
         
@@ -890,234 +1194,105 @@ def run_docking(
             'lepro_path': LEPRO_PATH,
             'gold_path': GOLD_PATH,
             'num_threads': NUM_THREADS,
-            'cutoff_value': CUTOFF_VALUE,
-            'exhaustiveness': SMINA_EXHAUSTIVENESS,  # Use smina exhaustiveness
-            'timeout': SMINA_TIMEOUT
+            'cutoff_value': CUTOFF_VALUE
         }
         job_data_list.append(job_data)
     
+    # Start overall timer
+    start_time = time.time()
+    
     # === STAGE 1: RUN SMINA DOCKING ===
-    logging.info(f"\n=== STAGE 1: SMINA DOCKING ===")
-    logging.info(f"Starting smina docking with {SMINA_MAX_PARALLEL_JOBS} processes...")
-    logging.info(f"Using exhaustiveness {SMINA_EXHAUSTIVENESS}")
-    logging.info(f"Timeout per job: {SMINA_TIMEOUT/60:.1f} minutes")
+    stage1_stats = run_stage_jobs(
+        job_data_list, 
+        "Stage 1: Smina Docking", 
+        run_single_smina_job,
+        SMINA_MAX_PARALLEL_JOBS,
+        SMINA_TIMEOUT
+    )
     
-    start_time = time.time()  # Overall start time for both stages
-    stage1_start_time = start_time
-    stage1_completed_jobs = 0
-    stage1_failed_jobs = 0
-    stage1_timeout_jobs = 0
-    stage1_skipped_jobs = 0
-    stage1_unique_processes = set()
-    last_progress_log = time.time()
-    progress_log_interval = 30  # Log progress every 30 seconds
+    # === STAGE 2: RUN GOLD DOCKING ===
+    stage2_stats = run_stage_jobs(
+        job_data_list, 
+        "Stage 2: Gold Docking", 
+        run_single_gold_job,
+        GOLD_MAX_PARALLEL_JOBS,
+        GOLD_TIMEOUT
+    )
     
-    with ProcessPoolExecutor(max_workers=SMINA_MAX_PARALLEL_JOBS) as executor:
-        # Submit all smina jobs
-        future_to_job = {executor.submit(run_single_smina_job, job_data): job_data for job_data in job_data_list}
-        
-        # Process results with progress bar
-        completed_futures = 0
-        for future in tqdm(as_completed(future_to_job), total=len(job_data_list), 
-                         desc="Stage 1: Smina Docking", unit="job"):
-            try:
-                result = future.result()
-                completed_futures += 1
-                
-                # Track unique processes
-                if 'process_id' in result:
-                    stage1_unique_processes.add(result['process_id'])
-                
-                if result['success']:
-                    if result['action'] == 'completed':
-                        stage1_completed_jobs += 1
-                        logging.info(f"Smina Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                    elif result['action'] == 'skipped':
-                        stage1_skipped_jobs += 1
-                        logging.debug(f"Smina Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                else:
-                    if result['action'] == 'timeout':
-                        stage1_timeout_jobs += 1
-                        logging.warning(f"Smina Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                    else:
-                        stage1_failed_jobs += 1
-                        logging.error(f"Smina Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                        if 'stdout' in result and result['stdout']:
-                            logging.error(f"STDOUT: {result['stdout']}")
-                        if 'stderr' in result and result['stderr']:
-                            logging.error(f"STDERR: {result['stderr']}")
-                
-                # Log progress periodically to the log file
-                current_time = time.time()
-                if current_time - last_progress_log >= progress_log_interval:
-                    percent_complete = (completed_futures / len(job_data_list)) * 100
-                    elapsed_time = current_time - stage1_start_time
-                    avg_time_per_job = elapsed_time / completed_futures if completed_futures > 0 else 0
-                    remaining_jobs = len(job_data_list) - completed_futures
-                    estimated_time_remaining = remaining_jobs * avg_time_per_job
-                    
-                    # Format elapsed time and ETA in human-readable format
-                    def format_time(seconds):
-                        if seconds < 60:
-                            return f"{seconds:.0f}s"
-                        elif seconds < 3600:
-                            return f"{seconds/60:.1f}m"
-                        else:
-                            return f"{seconds/3600:.1f}h"
-                    
-                    elapsed_str = format_time(elapsed_time)
-                    eta_str = format_time(estimated_time_remaining) if estimated_time_remaining > 0 else "N/A"
-                    
-                    logging.info(f"STAGE 1 PROGRESS: {percent_complete:.1f}% complete "
-                               f"({completed_futures}/{len(job_data_list)} jobs processed) | "
-                               f"✓{stage1_completed_jobs} completed, ✗{stage1_failed_jobs} failed, ⏱{stage1_timeout_jobs} timeout, ◊{stage1_skipped_jobs} skipped | "
-                               f"Elapsed: {elapsed_str}, ETA: {eta_str}")
-                    last_progress_log = current_time
-                        
-            except Exception as e:
-                stage1_failed_jobs += 1
-                completed_futures += 1
-                job_data = future_to_job[future]
-                logging.error(f"Exception in smina job {job_data['job_idx']+1}: {e}")
+    # === STAGE 3: RUN LEDOCK DOCKING ===
+    stage3_stats = run_stage_jobs(
+        job_data_list, 
+        "Stage 3: LeDock Docking", 
+        run_single_ledock_job,
+        LEDOCK_MAX_PARALLEL_JOBS,
+        LEDOCK_TIMEOUT
+    )
     
-    # Stage 1 summary
-    stage1_elapsed_time = time.time() - stage1_start_time
-    logging.info(f"\n=== STAGE 1 COMPLETED ===")
-    logging.info(f"Smina jobs completed successfully: {stage1_completed_jobs}")
-    logging.info(f"Smina jobs skipped (already completed): {stage1_skipped_jobs}")
-    logging.info(f"Smina jobs failed: {stage1_failed_jobs}")
-    logging.info(f"Smina jobs timed out: {stage1_timeout_jobs}")
-    logging.info(f"Stage 1 execution time: {stage1_elapsed_time:.2f} seconds")
-    logging.info(f"Used {len(stage1_unique_processes)} unique processes out of {SMINA_MAX_PARALLEL_JOBS} configured")
+    # === STAGE 4: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
+    # Filter jobs that need RMSD calculation (all tools complete but no final results)
+    rmsd_jobs = []
+    for job_data in job_data_list:
+        status = get_job_completion_status(job_data['current_outfolder'])
+        if status['smina'] and status['gold'] and status['ledock'] and not status['final_results']:
+            rmsd_jobs.append(job_data)
     
-    # === STAGE 2: RUN GOLD/LEDOCK DOCKING ===
-    logging.info(f"\n=== STAGE 2: GOLD/LEDOCK DOCKING ===")
-    logging.info(f"Starting gold/ledock docking with {GOLD_LEDOCK_MAX_PARALLEL_JOBS} processes...")
-    logging.info(f"Writing to existing directories created in Stage 1")
-    logging.info(f"Timeout per job: {GOLD_LEDOCK_TIMEOUT/60:.1f} minutes")
-    
-    stage2_start_time = time.time()
-    stage2_completed_jobs = 0
-    stage2_failed_jobs = 0
-    stage2_timeout_jobs = 0
-    stage2_skipped_jobs = 0
-    stage2_unique_processes = set()
-    last_progress_log = time.time()
-    
-    with ProcessPoolExecutor(max_workers=GOLD_LEDOCK_MAX_PARALLEL_JOBS) as executor:
-        # Update job data for stage 2 (gold/ledock) with correct timeout
-        stage2_job_data_list = []
-        for job_data in job_data_list:
-            stage2_job_data = job_data.copy()
-            stage2_job_data['timeout'] = GOLD_LEDOCK_TIMEOUT
-            stage2_job_data_list.append(stage2_job_data)
-        
-        # Submit all gold/ledock jobs
-        future_to_job = {executor.submit(run_single_gold_ledock_job, job_data): job_data for job_data in stage2_job_data_list}
-        
-        # Process results with progress bar
-        completed_futures = 0
-        for future in tqdm(as_completed(future_to_job), total=len(stage2_job_data_list), 
-                         desc="Stage 2: Gold/LeDock Docking", unit="job"):
-            try:
-                result = future.result()
-                completed_futures += 1
-                
-                # Track unique processes
-                if 'process_id' in result:
-                    stage2_unique_processes.add(result['process_id'])
-                
-                if result['success']:
-                    if result['action'] == 'completed':
-                        stage2_completed_jobs += 1
-                        logging.info(f"Gold/LeDock Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                    elif result['action'] == 'skipped':
-                        stage2_skipped_jobs += 1
-                        logging.debug(f"Gold/LeDock Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                else:
-                    if result['action'] == 'timeout':
-                        stage2_timeout_jobs += 1
-                        logging.warning(f"Gold/LeDock Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                    else:
-                        stage2_failed_jobs += 1
-                        logging.error(f"Gold/LeDock Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                        if 'stdout' in result and result['stdout']:
-                            logging.error(f"STDOUT: {result['stdout']}")
-                        if 'stderr' in result and result['stderr']:
-                            logging.error(f"STDERR: {result['stderr']}")
-                
-                # Log progress periodically to the log file
-                current_time = time.time()
-                if current_time - last_progress_log >= progress_log_interval:
-                    percent_complete = (completed_futures / len(stage2_job_data_list)) * 100
-                    elapsed_time = current_time - stage2_start_time
-                    avg_time_per_job = elapsed_time / completed_futures if completed_futures > 0 else 0
-                    remaining_jobs = len(stage2_job_data_list) - completed_futures
-                    estimated_time_remaining = remaining_jobs * avg_time_per_job
-                    
-                    # Format elapsed time and ETA in human-readable format
-                    def format_time(seconds):
-                        if seconds < 60:
-                            return f"{seconds:.0f}s"
-                        elif seconds < 3600:
-                            return f"{seconds/60:.1f}m"
-                        else:
-                            return f"{seconds/3600:.1f}h"
-                    
-                    elapsed_str = format_time(elapsed_time)
-                    eta_str = format_time(estimated_time_remaining) if estimated_time_remaining > 0 else "N/A"
-                    
-                    logging.info(f"STAGE 2 PROGRESS: {percent_complete:.1f}% complete "
-                               f"({completed_futures}/{len(stage2_job_data_list)} jobs processed) | "
-                               f"✓{stage2_completed_jobs} completed, ✗{stage2_failed_jobs} failed, ⏱{stage2_timeout_jobs} timeout, ◊{stage2_skipped_jobs} skipped | "
-                               f"Elapsed: {elapsed_str}, ETA: {eta_str}")
-                    last_progress_log = current_time
-                        
-            except Exception as e:
-                stage2_failed_jobs += 1
-                completed_futures += 1
-                job_data = future_to_job[future]
-                logging.error(f"Exception in gold/ledock job {job_data['job_idx']+1}: {e}")
+    stage4_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
+    if rmsd_jobs:
+        logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
+        stage4_stats = run_stage_jobs(
+            rmsd_jobs, 
+            "Stage 4: RMSD Calculation", 
+            run_single_rmsd_job,
+            RMSD_MAX_PARALLEL_JOBS,
+            RMSD_TIMEOUT
+        )
+    else:
+        logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
     
     # Calculate final statistics
-    stage2_elapsed_time = time.time() - stage2_start_time
     total_elapsed_time = time.time() - start_time
-    total_completed_jobs = stage1_completed_jobs + stage2_completed_jobs
-    total_skipped_jobs = stage1_skipped_jobs + stage2_skipped_jobs
-    total_failed_jobs = stage1_failed_jobs + stage2_failed_jobs
-    total_timeout_jobs = stage1_timeout_jobs + stage2_timeout_jobs
     
     # Final summary
-    logging.info(f"\n=== STAGE 2 COMPLETED ===")
-    logging.info(f"Gold/LeDock jobs completed successfully: {stage2_completed_jobs}")
-    logging.info(f"Gold/LeDock jobs skipped (already completed): {stage2_skipped_jobs}")
-    logging.info(f"Gold/LeDock jobs failed: {stage2_failed_jobs}")
-    logging.info(f"Gold/LeDock jobs timed out: {stage2_timeout_jobs}")
-    logging.info(f"Stage 2 execution time: {stage2_elapsed_time:.2f} seconds")
-    logging.info(f"Used {len(stage2_unique_processes)} unique processes out of {GOLD_LEDOCK_MAX_PARALLEL_JOBS} configured")
-    
-    logging.info(f"\n=== FINAL DOCKING SUMMARY ===")
+    logging.info(f"\n=== FINAL THREE-STAGE DOCKING SUMMARY ===")
     if TEST_MODE:
         logging.info(f"*** TEST MODE COMPLETED - RAN {min(len(docking_jobs), MAX_TEST_JOBS)} OUT OF {total_docking_jobs} POTENTIAL JOBS ***")
+    
     logging.info(f"Total potential docking jobs (before checking existence): {total_docking_jobs}")
-    logging.info(f"=== STAGE 1 (SMINA) RESULTS ===")
-    logging.info(f"Smina jobs completed successfully: {stage1_completed_jobs}")
-    logging.info(f"Smina jobs skipped (already completed): {stage1_skipped_jobs}")
-    logging.info(f"Smina jobs failed: {stage1_failed_jobs}")
-    logging.info(f"Smina jobs timed out (>{SMINA_TIMEOUT/60:.1f} minutes): {stage1_timeout_jobs}")
-    logging.info(f"=== STAGE 2 (GOLD/LEDOCK) RESULTS ===")
-    logging.info(f"Gold/LeDock jobs completed successfully: {stage2_completed_jobs}")
-    logging.info(f"Gold/LeDock jobs skipped (already completed): {stage2_skipped_jobs}")
-    logging.info(f"Gold/LeDock jobs failed: {stage2_failed_jobs}")
-    logging.info(f"Gold/LeDock jobs timed out (>{GOLD_LEDOCK_TIMEOUT/60:.1f} minutes): {stage2_timeout_jobs}")
-    logging.info(f"=== OVERALL RESULTS ===")
     logging.info(f"Total jobs attempted: {len(docking_jobs)}")
     logging.info(f"Total jobs skipped initially (missing ligand/uniprot/pdb info): {skipped_jobs}")
-    logging.info(f"Stage 1 execution time: {stage1_elapsed_time:.2f} seconds")
-    logging.info(f"Stage 2 execution time: {stage2_elapsed_time:.2f} seconds") 
+    
+    logging.info(f"=== STAGE 1 (SMINA) RESULTS ===")
+    logging.info(f"Smina jobs completed successfully: {stage1_stats['completed']}")
+    logging.info(f"Smina jobs skipped (already completed): {stage1_stats['skipped']}")
+    logging.info(f"Smina jobs failed: {stage1_stats['failed']}")
+    logging.info(f"Smina jobs timed out (>{SMINA_TIMEOUT/60:.1f} minutes): {stage1_stats['timeout']}")
+    
+    logging.info(f"=== STAGE 2 (GOLD) RESULTS ===")
+    logging.info(f"Gold jobs completed successfully: {stage2_stats['completed']}")
+    logging.info(f"Gold jobs skipped (already completed): {stage2_stats['skipped']}")
+    logging.info(f"Gold jobs failed: {stage2_stats['failed']}")
+    logging.info(f"Gold jobs timed out (>{GOLD_TIMEOUT/60:.1f} minutes): {stage2_stats['timeout']}")
+    
+    logging.info(f"=== STAGE 3 (LEDOCK) RESULTS ===")
+    logging.info(f"LeDock jobs completed successfully: {stage3_stats['completed']}")
+    logging.info(f"LeDock jobs skipped (already completed): {stage3_stats['skipped']}")
+    logging.info(f"LeDock jobs failed: {stage3_stats['failed']}")
+    logging.info(f"LeDock jobs timed out (>{LEDOCK_TIMEOUT/60:.1f} minutes): {stage3_stats['timeout']}")
+    
+    logging.info(f"=== STAGE 4 (RMSD) RESULTS ===")
+    logging.info(f"RMSD jobs completed successfully: {stage4_stats['completed']}")
+    logging.info(f"RMSD jobs skipped (already completed): {stage4_stats['skipped']}")
+    logging.info(f"RMSD jobs failed: {stage4_stats['failed']}")
+    logging.info(f"RMSD jobs timed out (>{RMSD_TIMEOUT/60:.1f} minutes): {stage4_stats['timeout']}")
+    
+    logging.info(f"=== OVERALL TIMING ===")
+    logging.info(f"Stage 1 execution time: {stage1_stats['elapsed_time']:.2f} seconds")
+    logging.info(f"Stage 2 execution time: {stage2_stats['elapsed_time']:.2f} seconds") 
+    logging.info(f"Stage 3 execution time: {stage3_stats['elapsed_time']:.2f} seconds")
+    logging.info(f"Stage 4 execution time: {stage4_stats['elapsed_time']:.2f} seconds")
     logging.info(f"Total execution time: {total_elapsed_time:.2f} seconds")
     logging.info(f"Average time per job: {total_elapsed_time/len(docking_jobs):.2f} seconds")
-    logging.info(f"Two-stage docking workflow finished.")
+    logging.info(f"Three-stage docking workflow finished.")
 
 def preview_docking_jobs(docking_jobs, preview_file="docking_jobs_preview.csv"):
     """
