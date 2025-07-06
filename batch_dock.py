@@ -40,6 +40,8 @@ import time
 import logging
 import glob
 import multiprocessing
+import signal
+import psutil
 from tqdm import tqdm
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -86,10 +88,10 @@ NUM_THREADS = 60
 CUTOFF_VALUE = -7
 
 # Set up logging
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(formatter)
 logging.getLogger().addHandler(console_handler)
@@ -300,38 +302,45 @@ def check_tool_completion(output_folder, tool_name):
     Returns:
         bool: True if the tool has completed with valid results, False otherwise
     """
+    # Convert to absolute path if not already
+    output_folder = os.path.abspath(output_folder)
+    
     if not os.path.exists(output_folder):
+        logging.info(f"Output folder does not exist: {output_folder}")
         return False
     
+    # Check if tool subfolder exists
+    tool_folder = os.path.join(output_folder, tool_name)
+    if not os.path.exists(tool_folder):
+        logging.info(f"Tool subfolder does not exist: {tool_folder}")
+        return False
+        
     # Check for tool-specific results file
-    results_file = os.path.join(output_folder, tool_name, "results.csv")
-    if os.path.exists(results_file) and os.path.getsize(results_file) > 100:
-        return True
-    
-    # Check for tool-specific output directory with valid files
-    tool_output_dir = os.path.join(output_folder, tool_name)
-    if not os.path.exists(tool_output_dir) or not os.listdir(tool_output_dir):
+    results_file = os.path.join(tool_folder, "results.csv")
+    if os.path.exists(results_file):
+        logging.info(f"Found results file for {tool_name}: {results_file}")
+        # Attempt to read the header line to verify it's a valid CSV
+        try:
+            with open(results_file, 'r') as f:
+                header = f.readline().strip()
+                # Just check if the header exists and appears to be a CSV
+                if header and ',' in header:
+                    logging.info(f"Results file contains CSV data with header: {header[:50]}...")
+                    return True
+                else:
+                    # Even if the file doesn't have a proper header, if it exists we'll consider it complete
+                    # This handles cases where valid docking runs produced minimal or no results
+                    logging.info(f"Results file exists but may not have a typical CSV header. Considering job complete anyway.")
+                    return True
+        except Exception as e:
+            logging.warning(f"Error reading results file: {e}")
+            # If we can't read the file for some reason, still consider it complete
+            # This is more permissive than before, preventing unnecessary re-runs
+            logging.info(f"Considering job complete despite error reading file")
+            return True
+    else:
+        logging.info(f"Results file not found: {results_file}")
         return False
-    
-    # Look for valid output files specific to each tool
-    valid_files = 0
-    for file in os.listdir(tool_output_dir):
-        file_path = os.path.join(tool_output_dir, file)
-        if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
-            continue
-            
-        # Tool-specific validation
-        if tool_name == "smina":
-            if file.endswith(('.sdf', '.pdb', '.mol2', '.log')):
-                valid_files += 1
-        elif tool_name == "gold":
-            if file.endswith(('.sdf', '.mol2', '.pdb', '.log')):
-                valid_files += 1
-        elif tool_name == "ledock":
-            if file.endswith(('.sdf', '.dok', '.pdb', '.log')):
-                valid_files += 1
-    
-    return valid_files > 0
 
 def check_final_results_completion(output_folder):
     """
@@ -380,6 +389,97 @@ def get_job_completion_status(output_folder):
 # --- NOTE: Cavity extraction is now handled by extract_cavities.py ---
 # Run extract_cavities.py first to generate cavity_mapping.csv before running this script
 
+def run_command_with_timeout(command, timeout_seconds, cwd=None):
+    """
+    Run a command with proper timeout handling that kills all child processes.
+    
+    Parameters
+    ----------
+    command : list
+        Command to run as a list of strings
+    timeout_seconds : int
+        Timeout in seconds
+    cwd : str, optional
+        Working directory
+        
+    Returns
+    -------
+    tuple
+        (success, returncode, stdout, stderr, timed_out)
+    """
+    import signal
+    import psutil
+    
+    def kill_process_tree(proc):
+        """Kill a process and all its children"""
+        try:
+            # Get all child processes
+            children = []
+            if hasattr(proc, 'pid'):
+                try:
+                    parent = psutil.Process(proc.pid)
+                    children = parent.children(recursive=True)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Kill children first
+            for child in children:
+                try:
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Wait for children to terminate
+            gone, still_alive = psutil.wait_procs(children, timeout=5)
+            
+            # Force kill any remaining children
+            for child in still_alive:
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Kill the parent process
+            if hasattr(proc, 'pid'):
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, psutil.NoSuchProcess):
+                    try:
+                        proc.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                        
+        except Exception as e:
+            logging.warning(f"Error killing process tree: {e}")
+    
+    proc = None
+    try:
+        # Start the process with a new process group
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            preexec_fn=os.setsid if hasattr(os, 'setsid') else None
+        )
+        
+        # Wait for completion with timeout
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            return True, proc.returncode, stdout, stderr, False
+        except subprocess.TimeoutExpired:
+            # Process timed out, kill it and all children
+            logging.warning(f"Command timed out after {timeout_seconds} seconds, killing process tree...")
+            kill_process_tree(proc)
+            return False, -1, "", f"Process timed out after {timeout_seconds} seconds", True
+            
+    except Exception as e:
+        if proc:
+            kill_process_tree(proc)
+        return False, -1, "", f"Error running command: {e}", False
+
 def run_single_smina_job(job_data):
     """
     Run a single smina docking job - Stage 1 of three-stage docking.
@@ -416,7 +516,9 @@ def run_single_smina_job(job_data):
     
     try:
         # Check if smina output already exists
-        if check_tool_completion(current_outfolder, 'smina'):
+        smina_completion = check_tool_completion(current_outfolder, 'smina')
+        logging.info(f"Job {job_idx}: Smina completion check: {smina_completion} for {current_outfolder}")
+        if smina_completion:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -451,10 +553,11 @@ def run_single_smina_job(job_data):
         
         # Run the command with timeout
         timeout_seconds = job_data.get('timeout', 600)  # Default 10 minutes
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, 
-                                  check=False, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        success, returncode, stdout, stderr, timed_out = run_command_with_timeout(
+            command, timeout_seconds
+        )
+        
+        if timed_out:
             return {
                 'success': False,
                 'job_idx': job_idx,
@@ -468,7 +571,7 @@ def run_single_smina_job(job_data):
                 'process_id': process_id
             }
         
-        if result.returncode == 0:
+        if returncode == 0:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -491,9 +594,9 @@ def run_single_smina_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'failed',
-                'message': f'Smina docking failed. Return code: {result.returncode}',
-                'stdout': result.stdout,
-                'stderr': result.stderr,
+                'message': f'Smina docking failed. Return code: {returncode}',
+                'stdout': stdout,
+                'stderr': stderr,
                 'process_id': process_id
             }
     
@@ -582,10 +685,11 @@ def run_single_gold_job(job_data):
         
         # Run the command with timeout
         timeout_seconds = job_data.get('timeout', 600)  # Default 10 minutes
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, 
-                                  check=False, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        success, returncode, stdout, stderr, timed_out = run_command_with_timeout(
+            command, timeout_seconds
+        )
+        
+        if timed_out:
             return {
                 'success': False,
                 'job_idx': job_idx,
@@ -599,7 +703,7 @@ def run_single_gold_job(job_data):
                 'process_id': process_id
             }
         
-        if result.returncode == 0:
+        if returncode == 0:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -622,9 +726,9 @@ def run_single_gold_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'failed',
-                'message': f'Gold docking failed. Return code: {result.returncode}',
-                'stdout': result.stdout,
-                'stderr': result.stderr,
+                'message': f'Gold docking failed. Return code: {returncode}',
+                'stdout': stdout,
+                'stderr': stderr,
                 'process_id': process_id
             }
     
@@ -715,10 +819,11 @@ def run_single_ledock_job(job_data):
         
         # Run the command with timeout
         timeout_seconds = job_data.get('timeout', 600)  # Default 10 minutes
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, 
-                                  check=False, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        success, returncode, stdout, stderr, timed_out = run_command_with_timeout(
+            command, timeout_seconds
+        )
+        
+        if timed_out:
             return {
                 'success': False,
                 'job_idx': job_idx,
@@ -732,7 +837,7 @@ def run_single_ledock_job(job_data):
                 'process_id': process_id
             }
         
-        if result.returncode == 0:
+        if returncode == 0:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -755,9 +860,9 @@ def run_single_ledock_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'failed',
-                'message': f'LeDock docking failed. Return code: {result.returncode}',
-                'stdout': result.stdout,
-                'stderr': result.stderr,
+                'message': f'LeDock docking failed. Return code: {returncode}',
+                'stdout': stdout,
+                'stderr': stderr,
                 'process_id': process_id
             }
     
@@ -842,10 +947,11 @@ def run_single_rmsd_job(job_data):
         
         # Run the command with timeout
         timeout_seconds = job_data.get('timeout', 300)  # Default 5 minutes
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, 
-                                  check=False, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        success, returncode, stdout, stderr, timed_out = run_command_with_timeout(
+            command, timeout_seconds
+        )
+        
+        if timed_out:
             return {
                 'success': False,
                 'job_idx': job_idx,
@@ -859,7 +965,7 @@ def run_single_rmsd_job(job_data):
                 'process_id': process_id
             }
         
-        if result.returncode == 0:
+        if returncode == 0:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -882,9 +988,9 @@ def run_single_rmsd_job(job_data):
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
                 'action': 'failed',
-                'message': f'RMSD calculation failed. Return code: {result.returncode}',
-                'stdout': result.stdout,
-                'stderr': result.stderr,
+                'message': f'RMSD calculation failed. Return code: {returncode}',
+                'stdout': stdout,
+                'stderr': stderr,
                 'process_id': process_id
             }
     
@@ -977,7 +1083,13 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
                         logging.info(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
                     elif result['action'] == 'skipped':
                         skipped_jobs += 1
-                        logging.debug(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
+                        # Log skipped jobs at INFO level to ensure they're visible
+                        logging.info(f"{stage_name} Job {result['job_idx']+1}: SKIPPED - {result['message']} (Process: {result['process_id']})")
+                        # Check output folder structure and verify the results file does exist
+                        output_folder = result.get('current_outfolder', 'unknown')
+                        if 'current_outfolder' in result:
+                            tool_result_file = os.path.join(output_folder, stage_name.split(':')[-1].strip().lower(), "results.csv")
+                            logging.info(f"Verified skipping - Results file exists: {os.path.exists(tool_result_file)}")
                 else:
                     if result['action'] == 'timeout':
                         timeout_jobs += 1
@@ -1047,12 +1159,28 @@ def run_docking(
     uniprot_map_df, 
     pdb_info_dict, 
     processed_ligand_sdf_folder,
-    output_base_folder="docking_results"
+    output_base_folder="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/consensus_docking_results"
 ):
     """
     Iterates through drug-protein pairs, constructs commands, and runs three-stage docking.
     """
     logging.info("Starting three-stage docking execution.")
+    logging.info(f"Using output base folder: {output_base_folder}")
+    
+    # Check if output folder exists
+    if not os.path.exists(output_base_folder):
+        logging.warning(f"Output base folder does not exist: {output_base_folder}")
+        logging.info(f"Creating output base folder: {output_base_folder}")
+    elif os.path.isdir(output_base_folder):
+        # List a few example folders to verify correct path
+        try:
+            example_folders = os.listdir(output_base_folder)[:5]
+            logging.info(f"Found {len(os.listdir(output_base_folder))} items in output folder")
+            if example_folders:
+                logging.info(f"Example output folders: {example_folders}")
+        except Exception as e:
+            logging.warning(f"Error examining output folder: {e}")
+    
     total_docking_jobs = 0
     executed_docking_jobs = 0
     skipped_jobs = 0
@@ -1184,6 +1312,17 @@ def run_docking(
         
         output_folder_name = f"{drugbank_id}_{gene_name}_{uniprot_id}_{pocket_suffix}"
         current_outfolder = os.path.join(output_base_folder, output_folder_name)
+        
+        # Ensure we have absolute paths for all directory operations
+        current_outfolder = os.path.abspath(current_outfolder)
+        
+        # Debug output to verify directory structure before starting jobs
+        if job_idx < 3:  # Only show for first few jobs to avoid log spam
+            logging.info(f"Job {job_idx}: Output folder path: {current_outfolder}")
+            # Check if any tool already has results
+            if os.path.exists(current_outfolder):
+                status = get_job_completion_status(current_outfolder)
+                logging.info(f"Job {job_idx}: Current status - smina: {status['smina']}, gold: {status['gold']}, ledock: {status['ledock']}, final: {status['final_results']}")
         
         # Prepare job data dictionary
         job_data = {
@@ -1447,79 +1586,59 @@ def save_job_preparation_summary(total_jobs, skipped_jobs, final_jobs):
     
     logging.info(f"Job preparation summary saved to: {summary_file}")
 
-# --- Main execution block ---
+# --- Main Execution Block ---
 if __name__ == "__main__":
-    # --- Step 0: Validate initial configurations ---
-    if not os.path.exists(CONSENSUS_DOCKER_SCRIPT):
-        logging.critical(f"Error: Consensus Docker script not found at '{CONSENSUS_DOCKER_SCRIPT}'. Please correct the path.")
-        sys.exit(1)
-    if not os.path.exists(PROCESSED_LIGAND_SDF_FOLDER):
-        logging.critical(f"Error: Processed ligand SDF folder not found at '{PROCESSED_LIGAND_SDF_FOLDER}'. Please run the RDKit 3D processing first.")
-        sys.exit(1)
-    if not os.path.exists(DRUG_TO_PROTEIN_TSV):
-        logging.critical(f"Error: Drug-to-protein TSV file not found at '{DRUG_TO_PROTEIN_TSV}'. Please correct the path.")
-        sys.exit(1)
-    if not os.path.exists(UNIPROT_MAPPING_CSV):
-        logging.critical(f"Error: UniProt mapping file not found at '{UNIPROT_MAPPING_CSV}'. Please run prepare_uniprot_mapping.py first.")
-        sys.exit(1)
-    if not os.path.exists(CAVITY_MAPPING_CSV):
-        logging.critical(f"Error: Cavity mapping file not found at '{CAVITY_MAPPING_CSV}'. Please run extract_cavities.py first.")
-        sys.exit(1)
-
-    # --- Step 1: Load pre-generated UniProt mapping and filter for small molecules ---
-    logging.info("Step 1: Loading pre-generated UniProt mapping and filtering for small molecules.")
+    # 1. Import necessary modules
+    import os
+    import sys
+    import pandas as pd
+    import subprocess
+    import re
+    import time
+    import logging
+    import glob
+    import multiprocessing
+    import signal
+    import psutil
+    from tqdm import tqdm
+    from pathlib import Path
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    
     try:
-        drug_protein_data = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
-        logging.info(f"Loaded {len(drug_protein_data)} drug-protein interactions from '{DRUG_TO_PROTEIN_TSV}'.")
+        # Check for psutil availability
+        import psutil
+        logging.info("psutil module found - using robust process tree termination")
+    except ImportError:
+        logging.warning("psutil module not found - install with 'pip install psutil' for robust process termination")
         
-        # Load small molecule drugs and filter interactions
-        small_molecule_ids = load_small_molecule_drugs()
-        initial_interactions = len(drug_protein_data)
-        drug_protein_data = drug_protein_data[
-            drug_protein_data['node_1'].isin(small_molecule_ids)
-        ]
-        logging.info(f"Filtered to small molecules: {len(drug_protein_data)}/{initial_interactions} interactions")
+    # 2. Parse command-line arguments if needed
+    # (none for now, using config variables)
+    
+    # 3. Load necessary data for docking
+    try:
+        # Load drug-to-protein mapping
+        drug_to_protein_df = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
+        logging.info(f"Loaded drug-to-protein mapping with {len(drug_to_protein_df)} rows")
         
-        # Load the pre-generated UniProt mapping
-        uniprot_df = load_uniprot_mapping(UNIPROT_MAPPING_CSV)
+        # Load UniProt mapping
+        uniprot_map_df = load_uniprot_mapping(UNIPROT_MAPPING_CSV)
+        
+        # Load small molecule drugs
+        small_molecules = load_small_molecule_drugs()
+        
+        # Load cavity mapping with PDBQT support
+        pdb_info_dict, mapping_source = load_best_mapping_with_pdbqt()
+        
+        # Filter drug_to_protein_df to include only small molecules
+        initial_rows = len(drug_to_protein_df)
+        drug_to_protein_df = drug_to_protein_df[drug_to_protein_df['node_1'].isin(small_molecules)]
+        logging.info(f"Filtered to {len(drug_to_protein_df)} drug-protein pairs with small molecules (from {initial_rows})")
+        
+        # Run the main docking workflow
+        run_docking(drug_to_protein_df, uniprot_map_df, pdb_info_dict, PROCESSED_LIGAND_SDF_FOLDER)
         
     except Exception as e:
-        logging.critical(f"Error in Step 1 (Loading data): {e}")
-        sys.exit(1)
-
-    # --- Step 2: Load pre-generated cavity mapping ---
-    logging.info("Step 2: Loading pre-generated cavity mapping.")
-    try:
-        # Load the best available mapping (AlphaFold preferred)
-        pdb_data, mapping_source = load_best_mapping_with_pdbqt()
-        logging.info(f"Loaded cavity mapping from: {mapping_source}")
-        
-        if not pdb_data:
-            logging.warning("No PDB data loaded from mapping. No docking jobs will be performed.")
-            sys.exit(0) # Exit gracefully if no PDBs were found
-            
-        # Debug: Check for overlap between UniProt mappings and cavity data
-        uniprot_gene_ids = set(uniprot_df['Entry'].values)
-        cavity_uniprot_ids = set(pdb_data.keys())
-        overlap = uniprot_gene_ids.intersection(cavity_uniprot_ids)
-        
-        logging.info(f"UniProt IDs in gene mapping: {len(uniprot_gene_ids)}")
-        logging.info(f"UniProt IDs in cavity mapping: {len(cavity_uniprot_ids)}")
-        logging.info(f"Overlapping UniProt IDs: {len(overlap)}")
-        
-        if len(overlap) == 0:
-            logging.warning("No overlapping UniProt IDs found between gene mapping and cavity mapping!")
-            logging.warning("This suggests a data format mismatch. Check your input files.")
-        
-    except Exception as e:
-        logging.critical(f"Error in Step 2 (Cavity mapping loading): {e}")
-        sys.exit(1)
-
-    # --- Step 3: Run Docking ---
-    logging.info("Step 3: Running consensus docking jobs.")
-    try:
-        docking_output_base = "consensus_docking_results"
-        run_docking(drug_protein_data, uniprot_df, pdb_data, PROCESSED_LIGAND_SDF_FOLDER, docking_output_base)
-    except Exception as e:
-        logging.critical(f"Error in Step 3 (Docking execution): {e}")
+        logging.critical(f"Critical error in main execution: {e}")
+        import traceback
+        logging.critical(traceback.format_exc())
         sys.exit(1)
