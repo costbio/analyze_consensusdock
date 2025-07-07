@@ -63,6 +63,13 @@ TEST_MODE = False
 MAX_TEST_JOBS = 40
 # --- CONFIRMATION PROMPT: Set to True to skip user confirmation when not in TEST_MODE ---
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
+# --- DOCKING TOOLS SELECTION ---
+# Set to True to enable each docking tool, False to disable
+USE_SMINA = False                # Enable/disable Smina docking
+USE_GOLD = False                 # Enable/disable Gold docking  
+USE_LEDOCK = True               # Enable/disable LeDock docking
+USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
+
 # --- THREE-STAGE DOCKING CONFIGURATION ---
 # Stage 1: Smina only (high exhaustiveness, low parallelism)
 SMINA_MAX_PARALLEL_JOBS = 4     # Maximum parallel jobs for smina stage
@@ -103,11 +110,39 @@ else:
     logging.info("*** RUNNING IN PRODUCTION MODE ***")
 if SKIP_CONFIRMATION:
     logging.info("*** SKIP_CONFIRMATION ENABLED - NO USER PROMPT REQUIRED ***")
-logging.info(f"*** THREE-STAGE PARALLEL EXECUTION ENABLED ***")
-logging.info(f"*** STAGE 1: SMINA - UP TO {SMINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {SMINA_EXHAUSTIVENESS}, TIMEOUT {SMINA_TIMEOUT/60:.1f} MINUTES ***")
-logging.info(f"*** STAGE 2: GOLD - UP TO {GOLD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GOLD_EXHAUSTIVENESS}, TIMEOUT {GOLD_TIMEOUT/60:.1f} MINUTES ***")
-logging.info(f"*** STAGE 3: LEDOCK - UP TO {LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {LEDOCK_EXHAUSTIVENESS}, TIMEOUT {LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
-logging.info(f"*** STAGE 4: RMSD CALCULATION - UP TO {RMSD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {RMSD_TIMEOUT/60:.1f} MINUTES ***")
+
+# Log which tools are enabled
+enabled_tools = []
+if USE_SMINA:
+    enabled_tools.append("SMINA")
+if USE_GOLD:
+    enabled_tools.append("GOLD")
+if USE_LEDOCK:
+    enabled_tools.append("LEDOCK")
+if USE_RMSD_CALCULATION:
+    enabled_tools.append("RMSD")
+
+logging.info(f"*** ENABLED DOCKING TOOLS: {', '.join(enabled_tools) if enabled_tools else 'NONE'} ***")
+
+if USE_SMINA:
+    logging.info(f"*** STAGE 1: SMINA - UP TO {SMINA_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {SMINA_EXHAUSTIVENESS}, TIMEOUT {SMINA_TIMEOUT/60:.1f} MINUTES ***")
+else:
+    logging.info("*** STAGE 1: SMINA - DISABLED ***")
+
+if USE_GOLD:
+    logging.info(f"*** STAGE 2: GOLD - UP TO {GOLD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {GOLD_EXHAUSTIVENESS}, TIMEOUT {GOLD_TIMEOUT/60:.1f} MINUTES ***")
+else:
+    logging.info("*** STAGE 2: GOLD - DISABLED ***")
+
+if USE_LEDOCK:
+    logging.info(f"*** STAGE 3: LEDOCK - UP TO {LEDOCK_MAX_PARALLEL_JOBS} CONCURRENT JOBS, EXHAUSTIVENESS {LEDOCK_EXHAUSTIVENESS}, TIMEOUT {LEDOCK_TIMEOUT/60:.1f} MINUTES ***")
+else:
+    logging.info("*** STAGE 3: LEDOCK - DISABLED ***")
+
+if USE_RMSD_CALCULATION:
+    logging.info(f"*** STAGE 4: RMSD CALCULATION - UP TO {RMSD_MAX_PARALLEL_JOBS} CONCURRENT JOBS, TIMEOUT {RMSD_TIMEOUT/60:.1f} MINUTES ***")
+else:
+    logging.info("*** STAGE 4: RMSD CALCULATION - DISABLED ***")
 logging.info(f"Consensus Docker Script: {CONSENSUS_DOCKER_SCRIPT}")
 logging.info(f"Processed Ligand SDF Folder: {PROCESSED_LIGAND_SDF_FOLDER}")
 logging.info(f"Drug-to-Protein TSV: {DRUG_TO_PROTEIN_TSV}")
@@ -118,6 +153,23 @@ if os.path.exists(PDBQT_MAPPING_CSV):
     logging.info("PDBQT mapping found - will use pre-converted PDBQT files for faster docking")
 else:
     logging.info("PDBQT mapping not found - will use PDB files (slower conversion during docking)")
+
+# Log configuration at startup
+logging.info("=== BATCH DOCK CONFIGURATION ===")
+logging.info(f"USE_SMINA: {USE_SMINA}")
+logging.info(f"USE_GOLD: {USE_GOLD}")
+logging.info(f"USE_LEDOCK: {USE_LEDOCK}")
+logging.info(f"USE_RMSD_CALCULATION: {USE_RMSD_CALCULATION}")
+logging.info(f"TEST_MODE: {TEST_MODE}")
+logging.info(f"SKIP_CONFIRMATION: {SKIP_CONFIRMATION}")
+logging.info("=" * 35)
+
+# Validate that at least one tool is enabled
+if not any([USE_SMINA, USE_GOLD, USE_LEDOCK]):
+    logging.warning("WARNING: No docking tools are enabled! At least one of USE_SMINA, USE_GOLD, or USE_LEDOCK should be True.")
+    if not USE_RMSD_CALCULATION:
+        logging.error("ERROR: No tools are enabled at all. Please enable at least one docking tool or RMSD calculation.")
+        sys.exit(1)
 
 def load_uniprot_mapping(mapping_file):
     """
@@ -1283,10 +1335,33 @@ def run_docking(
 
     # Prepare job data for three-stage multiprocessing
     logging.info(f"Preparing {len(docking_jobs)} jobs for three-stage parallel execution...")
-    logging.info(f"Stage 1: Smina with {SMINA_MAX_PARALLEL_JOBS} processes, exhaustiveness {SMINA_EXHAUSTIVENESS}")
-    logging.info(f"Stage 2: Gold with {GOLD_MAX_PARALLEL_JOBS} processes, exhaustiveness {GOLD_EXHAUSTIVENESS}")
-    logging.info(f"Stage 3: LeDock with {LEDOCK_MAX_PARALLEL_JOBS} processes, exhaustiveness {LEDOCK_EXHAUSTIVENESS}")
-    logging.info(f"Stage 4: RMSD with {RMSD_MAX_PARALLEL_JOBS} processes")
+    
+    # Log which tools are enabled/disabled
+    logging.info("=== DOCKING TOOLS CONFIGURATION ===")
+    logging.info(f"Stage 1 - Smina: {'ENABLED' if USE_SMINA else 'DISABLED'}")
+    if USE_SMINA:
+        logging.info(f"  - Max parallel jobs: {SMINA_MAX_PARALLEL_JOBS}")
+        logging.info(f"  - Exhaustiveness: {SMINA_EXHAUSTIVENESS}")
+        logging.info(f"  - Timeout: {SMINA_TIMEOUT/60:.1f} minutes")
+    
+    logging.info(f"Stage 2 - Gold: {'ENABLED' if USE_GOLD else 'DISABLED'}")
+    if USE_GOLD:
+        logging.info(f"  - Max parallel jobs: {GOLD_MAX_PARALLEL_JOBS}")
+        logging.info(f"  - Exhaustiveness: {GOLD_EXHAUSTIVENESS}")
+        logging.info(f"  - Timeout: {GOLD_TIMEOUT/60:.1f} minutes")
+    
+    logging.info(f"Stage 3 - LeDock: {'ENABLED' if USE_LEDOCK else 'DISABLED'}")
+    if USE_LEDOCK:
+        logging.info(f"  - Max parallel jobs: {LEDOCK_MAX_PARALLEL_JOBS}")
+        logging.info(f"  - Exhaustiveness: {LEDOCK_EXHAUSTIVENESS}")
+        logging.info(f"  - Timeout: {LEDOCK_TIMEOUT/60:.1f} minutes")
+    
+    logging.info(f"Stage 4 - RMSD Calculation: {'ENABLED' if USE_RMSD_CALCULATION else 'DISABLED'}")
+    if USE_RMSD_CALCULATION:
+        logging.info(f"  - Max parallel jobs: {RMSD_MAX_PARALLEL_JOBS}")
+        logging.info(f"  - Timeout: {RMSD_TIMEOUT/60:.1f} minutes")
+    
+    logging.info("=" * 40)
     
     job_data_list = []
     
@@ -1349,56 +1424,89 @@ def run_docking(
     # Start overall timer
     start_time = time.time()
     
-    # === STAGE 1: RUN SMINA DOCKING ===
-    stage1_stats = run_stage_jobs(
-        job_data_list=job_data_list, 
-        stage_name="Stage 1: Smina Docking", 
-        job_function=run_single_smina_job,
-        max_workers=SMINA_MAX_PARALLEL_JOBS,
-        timeout=SMINA_TIMEOUT,
-        exhaustiveness=SMINA_EXHAUSTIVENESS
-    )
-    
-    # === STAGE 2: RUN GOLD DOCKING ===
-    stage2_stats = run_stage_jobs(
-        job_data_list=job_data_list, 
-        stage_name="Stage 2: Gold Docking", 
-        job_function=run_single_gold_job,
-        max_workers=GOLD_MAX_PARALLEL_JOBS,
-        timeout=GOLD_TIMEOUT,
-        exhaustiveness=GOLD_EXHAUSTIVENESS
-    )
-    
-    # === STAGE 3: RUN LEDOCK DOCKING ===
-    stage3_stats = run_stage_jobs(
-        job_data_list=job_data_list, 
-        stage_name="Stage 3: LeDock Docking", 
-        job_function=run_single_ledock_job,
-        max_workers=LEDOCK_MAX_PARALLEL_JOBS,
-        timeout=LEDOCK_TIMEOUT,
-        exhaustiveness=LEDOCK_EXHAUSTIVENESS
-    )
-    
-    # === STAGE 4: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
-    # Filter jobs that need RMSD calculation (all tools complete but no final results)
-    rmsd_jobs = []
-    for job_data in job_data_list:
-        status = get_job_completion_status(job_data['current_outfolder'])
-        if status['smina'] and status['gold'] and status['ledock'] and not status['final_results']:
-            rmsd_jobs.append(job_data)
-    
+    # Initialize stage statistics
+    stage1_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
+    stage2_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
+    stage3_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
     stage4_stats = {'completed': 0, 'skipped': 0, 'failed': 0, 'timeout': 0, 'elapsed_time': 0, 'unique_processes': 0}
-    if rmsd_jobs:
-        logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
-        stage4_stats = run_stage_jobs(
-            job_data_list=rmsd_jobs, 
-            stage_name="Stage 4: RMSD Calculation", 
-            job_function=run_single_rmsd_job,
-            max_workers=RMSD_MAX_PARALLEL_JOBS,
-            timeout=RMSD_TIMEOUT
+    
+    # === STAGE 1: RUN SMINA DOCKING ===
+    if USE_SMINA:
+        logging.info("Stage 1: Smina docking is ENABLED")
+        stage1_stats = run_stage_jobs(
+            job_data_list=job_data_list, 
+            stage_name="Stage 1: Smina Docking", 
+            job_function=run_single_smina_job,
+            max_workers=SMINA_MAX_PARALLEL_JOBS,
+            timeout=SMINA_TIMEOUT,
+            exhaustiveness=SMINA_EXHAUSTIVENESS
         )
     else:
-        logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
+        logging.info("Stage 1: Smina docking is DISABLED - skipping")
+    
+    # === STAGE 2: RUN GOLD DOCKING ===
+    if USE_GOLD:
+        logging.info("Stage 2: Gold docking is ENABLED")
+        stage2_stats = run_stage_jobs(
+            job_data_list=job_data_list, 
+            stage_name="Stage 2: Gold Docking", 
+            job_function=run_single_gold_job,
+            max_workers=GOLD_MAX_PARALLEL_JOBS,
+            timeout=GOLD_TIMEOUT,
+            exhaustiveness=GOLD_EXHAUSTIVENESS
+        )
+    else:
+        logging.info("Stage 2: Gold docking is DISABLED - skipping")
+    
+    # === STAGE 3: RUN LEDOCK DOCKING ===
+    if USE_LEDOCK:
+        logging.info("Stage 3: LeDock docking is ENABLED")
+        stage3_stats = run_stage_jobs(
+            job_data_list=job_data_list, 
+            stage_name="Stage 3: LeDock Docking", 
+            job_function=run_single_ledock_job,
+            max_workers=LEDOCK_MAX_PARALLEL_JOBS,
+            timeout=LEDOCK_TIMEOUT,
+            exhaustiveness=LEDOCK_EXHAUSTIVENESS
+        )
+    else:
+        logging.info("Stage 3: LeDock docking is DISABLED - skipping")
+    
+    # === STAGE 4: RUN RMSD CALCULATION FOR INCOMPLETE JOBS ===
+    if USE_RMSD_CALCULATION:
+        logging.info("Stage 4: RMSD calculation is ENABLED")
+        # Filter jobs that need RMSD calculation
+        # Only require enabled tools to be complete for RMSD calculation
+        rmsd_jobs = []
+        for job_data in job_data_list:
+            status = get_job_completion_status(job_data['current_outfolder'])
+            
+            # Check if all enabled tools are complete
+            tools_complete = True
+            if USE_SMINA and not status['smina']:
+                tools_complete = False
+            if USE_GOLD and not status['gold']:
+                tools_complete = False
+            if USE_LEDOCK and not status['ledock']:
+                tools_complete = False
+            
+            # Only add to RMSD jobs if all enabled tools are complete but final results don't exist
+            if tools_complete and not status['final_results']:
+                rmsd_jobs.append(job_data)
+        
+        if rmsd_jobs:
+            logging.info(f"Found {len(rmsd_jobs)} jobs needing RMSD calculation")
+            stage4_stats = run_stage_jobs(
+                job_data_list=rmsd_jobs, 
+                stage_name="Stage 4: RMSD Calculation", 
+                job_function=run_single_rmsd_job,
+                max_workers=RMSD_MAX_PARALLEL_JOBS,
+                timeout=RMSD_TIMEOUT
+            )
+        else:
+            logging.info("No jobs need RMSD calculation - all are either incomplete or already have final results")
+    else:
+        logging.info("Stage 4: RMSD calculation is DISABLED - skipping")
     
     # Calculate final statistics
     total_elapsed_time = time.time() - start_time
@@ -1412,35 +1520,52 @@ def run_docking(
     logging.info(f"Total jobs attempted: {len(docking_jobs)}")
     logging.info(f"Total jobs skipped initially (missing ligand/uniprot/pdb info): {skipped_jobs}")
     
-    logging.info(f"=== STAGE 1 (SMINA) RESULTS ===")
-    logging.info(f"Smina jobs completed successfully: {stage1_stats['completed']}")
-    logging.info(f"Smina jobs skipped (already completed): {stage1_stats['skipped']}")
-    logging.info(f"Smina jobs failed: {stage1_stats['failed']}")
-    logging.info(f"Smina jobs timed out (>{SMINA_TIMEOUT/60:.1f} minutes): {stage1_stats['timeout']}")
+    # Show results only for enabled tools
+    if USE_SMINA:
+        logging.info(f"=== STAGE 1 (SMINA) RESULTS ===")
+        logging.info(f"Smina jobs completed successfully: {stage1_stats['completed']}")
+        logging.info(f"Smina jobs skipped (already completed): {stage1_stats['skipped']}")
+        logging.info(f"Smina jobs failed: {stage1_stats['failed']}")
+        logging.info(f"Smina jobs timed out (>{SMINA_TIMEOUT/60:.1f} minutes): {stage1_stats['timeout']}")
+    else:
+        logging.info(f"=== STAGE 1 (SMINA) DISABLED ===")
     
-    logging.info(f"=== STAGE 2 (GOLD) RESULTS ===")
-    logging.info(f"Gold jobs completed successfully: {stage2_stats['completed']}")
-    logging.info(f"Gold jobs skipped (already completed): {stage2_stats['skipped']}")
-    logging.info(f"Gold jobs failed: {stage2_stats['failed']}")
-    logging.info(f"Gold jobs timed out (>{GOLD_TIMEOUT/60:.1f} minutes): {stage2_stats['timeout']}")
+    if USE_GOLD:
+        logging.info(f"=== STAGE 2 (GOLD) RESULTS ===")
+        logging.info(f"Gold jobs completed successfully: {stage2_stats['completed']}")
+        logging.info(f"Gold jobs skipped (already completed): {stage2_stats['skipped']}")
+        logging.info(f"Gold jobs failed: {stage2_stats['failed']}")
+        logging.info(f"Gold jobs timed out (>{GOLD_TIMEOUT/60:.1f} minutes): {stage2_stats['timeout']}")
+    else:
+        logging.info(f"=== STAGE 2 (GOLD) DISABLED ===")
     
-    logging.info(f"=== STAGE 3 (LEDOCK) RESULTS ===")
-    logging.info(f"LeDock jobs completed successfully: {stage3_stats['completed']}")
-    logging.info(f"LeDock jobs skipped (already completed): {stage3_stats['skipped']}")
-    logging.info(f"LeDock jobs failed: {stage3_stats['failed']}")
-    logging.info(f"LeDock jobs timed out (>{LEDOCK_TIMEOUT/60:.1f} minutes): {stage3_stats['timeout']}")
+    if USE_LEDOCK:
+        logging.info(f"=== STAGE 3 (LEDOCK) RESULTS ===")
+        logging.info(f"LeDock jobs completed successfully: {stage3_stats['completed']}")
+        logging.info(f"LeDock jobs skipped (already completed): {stage3_stats['skipped']}")
+        logging.info(f"LeDock jobs failed: {stage3_stats['failed']}")
+        logging.info(f"LeDock jobs timed out (>{LEDOCK_TIMEOUT/60:.1f} minutes): {stage3_stats['timeout']}")
+    else:
+        logging.info(f"=== STAGE 3 (LEDOCK) DISABLED ===")
     
-    logging.info(f"=== STAGE 4 (RMSD) RESULTS ===")
-    logging.info(f"RMSD jobs completed successfully: {stage4_stats['completed']}")
-    logging.info(f"RMSD jobs skipped (already completed): {stage4_stats['skipped']}")
-    logging.info(f"RMSD jobs failed: {stage4_stats['failed']}")
-    logging.info(f"RMSD jobs timed out (>{RMSD_TIMEOUT/60:.1f} minutes): {stage4_stats['timeout']}")
+    if USE_RMSD_CALCULATION:
+        logging.info(f"=== STAGE 4 (RMSD) RESULTS ===")
+        logging.info(f"RMSD jobs completed successfully: {stage4_stats['completed']}")
+        logging.info(f"RMSD jobs skipped (already completed): {stage4_stats['skipped']}")
+        logging.info(f"RMSD jobs failed: {stage4_stats['failed']}")
+        logging.info(f"RMSD jobs timed out (>{RMSD_TIMEOUT/60:.1f} minutes): {stage4_stats['timeout']}")
+    else:
+        logging.info(f"=== STAGE 4 (RMSD) DISABLED ===")
     
     logging.info(f"=== OVERALL TIMING ===")
-    logging.info(f"Stage 1 execution time: {stage1_stats['elapsed_time']:.2f} seconds")
-    logging.info(f"Stage 2 execution time: {stage2_stats['elapsed_time']:.2f} seconds") 
-    logging.info(f"Stage 3 execution time: {stage3_stats['elapsed_time']:.2f} seconds")
-    logging.info(f"Stage 4 execution time: {stage4_stats['elapsed_time']:.2f} seconds")
+    if USE_SMINA:
+        logging.info(f"Stage 1 execution time: {stage1_stats['elapsed_time']:.2f} seconds")
+    if USE_GOLD:
+        logging.info(f"Stage 2 execution time: {stage2_stats['elapsed_time']:.2f} seconds")
+    if USE_LEDOCK:
+        logging.info(f"Stage 3 execution time: {stage3_stats['elapsed_time']:.2f} seconds")
+    if USE_RMSD_CALCULATION:
+        logging.info(f"Stage 4 execution time: {stage4_stats['elapsed_time']:.2f} seconds")
     logging.info(f"Total execution time: {total_elapsed_time:.2f} seconds")
     logging.info(f"Average time per job: {total_elapsed_time/len(docking_jobs):.2f} seconds")
     logging.info(f"Three-stage docking workflow finished.")
