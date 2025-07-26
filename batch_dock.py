@@ -38,10 +38,21 @@ import subprocess
 import re
 import time
 import logging
+import os
+import sys
+import pandas as pd
+import subprocess
+import re
+import time
+import logging
 import glob
 import multiprocessing
 import signal
 import psutil
+import shutil
+import threading
+import queue
+from collections import deque
 from tqdm import tqdm
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -65,27 +76,44 @@ MAX_TEST_JOBS = 40
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
 # --- DOCKING TOOLS SELECTION ---
 # Set to True to enable each docking tool, False to disable
-USE_SMINA = False                # Enable/disable Smina docking
+USE_SMINA = True                # Enable/disable Smina docking
 USE_GOLD = False                 # Enable/disable Gold docking  
-USE_LEDOCK = True               # Enable/disable LeDock docking
-USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
+USE_LEDOCK = False               # Enable/disable LeDock docking
+USE_RMSD_CALCULATION = False     # Enable/disable final RMSD calculation
+
+# --- ADAPTIVE EXHAUSTIVENESS AND UPDATE MODE ---
+USE_ADAPTIVE_EXHAUSTIVENESS = True  # Use adaptive exhaustiveness for Smina (new feature)
+UPDATE_SMINA_ONLY = True            # If True, only update Smina results, preserve Gold/LeDock
+FORCE_RMSD_RECALCULATION = True     # If True, force RMSD recalculation even if final results exist
+
+# --- DYNAMIC RESOURCE MANAGEMENT ---
+# NEW: Real-time job submission based on CPU availability (no batching)
+# Optimized for 64-core systems: submits jobs one-by-one when CPU < threshold
+# Takes into account actual CPU cores used per job (exhaustiveness parameter)
+ENABLE_DYNAMIC_RESOURCE_MANAGEMENT = True  # Enable adaptive parallelism based on system load
+CPU_THRESHOLD = 60.0                       # Submit new jobs only when CPU < this % 
+MEMORY_THRESHOLD = 85.0                    # Reduce parallelism if memory usage exceeds this %
+RESOURCE_CHECK_INTERVAL = 2               # Check system resources every N seconds (faster for real-time)
+MIN_PARALLEL_JOBS = 1                      # Minimum number of parallel jobs
+MAX_PARALLEL_JOBS_ADAPTIVE = 4             # Conservative maximum (will be calculated based on exhaustiveness)
+ADAPTIVE_SCALING_FACTOR = 0.8              # Factor to reduce jobs when resources are high
 
 # --- THREE-STAGE DOCKING CONFIGURATION ---
-# Stage 1: Smina only (high exhaustiveness, low parallelism)
+# Stage 1: Smina only (high exhaustiveness = high CPU usage per job, low parallelism)
 SMINA_MAX_PARALLEL_JOBS = 4     # Maximum parallel jobs for smina stage
-SMINA_EXHAUSTIVENESS = 16       # High exhaustiveness for smina
-SMINA_TIMEOUT = 300           # Timeout for smina jobs in seconds (5 minutes)
-# Stage 2: Gold (medium parallelism, standard exhaustiveness)
+SMINA_EXHAUSTIVENESS = 16       # High exhaustiveness for smina (CPU cores used per job)
+SMINA_TIMEOUT = 3000           # Timeout for smina jobs in seconds (50 minutes)
+# Stage 2: Gold (single-threaded, high parallelism possible)
 GOLD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for gold stage
-GOLD_EXHAUSTIVENESS = 12        # Standard exhaustiveness for gold
+GOLD_EXHAUSTIVENESS = 12        # Kept for compatibility but ignored by Gold (single-threaded)
 GOLD_TIMEOUT = 600              # Timeout for gold jobs in seconds (10 minutes)
-# Stage 3: LeDock (high parallelism, standard exhaustiveness)
+# Stage 3: LeDock (single-threaded, high parallelism possible)
 LEDOCK_MAX_PARALLEL_JOBS = 60   # Maximum parallel jobs for ledock stage
-LEDOCK_EXHAUSTIVENESS = 12      # Standard exhaustiveness for ledock
+LEDOCK_EXHAUSTIVENESS = 12      # Kept for compatibility but ignored by LeDock (single-threaded)
 LEDOCK_TIMEOUT = 600            # Timeout for ledock jobs in seconds (10 minutes)
 # Stage 4: RMSD calculation (if all tools completed but final results missing)
 RMSD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for RMSD calculation
-RMSD_TIMEOUT = 300              # Timeout for RMSD calculation in seconds (5 minutes)
+RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds (50 minutes)
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
@@ -160,6 +188,11 @@ logging.info(f"USE_SMINA: {USE_SMINA}")
 logging.info(f"USE_GOLD: {USE_GOLD}")
 logging.info(f"USE_LEDOCK: {USE_LEDOCK}")
 logging.info(f"USE_RMSD_CALCULATION: {USE_RMSD_CALCULATION}")
+if not USE_RMSD_CALCULATION:
+    logging.info("*** RMSD CALCULATION DISABLED - Using --skip_rmsd flag for all docking tools ***")
+logging.info(f"USE_ADAPTIVE_EXHAUSTIVENESS: {USE_ADAPTIVE_EXHAUSTIVENESS}")
+logging.info(f"UPDATE_SMINA_ONLY: {UPDATE_SMINA_ONLY}")
+logging.info(f"FORCE_RMSD_RECALCULATION: {FORCE_RMSD_RECALCULATION}")
 logging.info(f"TEST_MODE: {TEST_MODE}")
 logging.info(f"SKIP_CONFIRMATION: {SKIP_CONFIRMATION}")
 logging.info("=" * 35)
@@ -170,6 +203,140 @@ if not any([USE_SMINA, USE_GOLD, USE_LEDOCK]):
     if not USE_RMSD_CALCULATION:
         logging.error("ERROR: No tools are enabled at all. Please enable at least one docking tool or RMSD calculation.")
         sys.exit(1)
+
+class ResourceMonitor:
+    """Monitors system resources and provides recommendations for parallel job execution."""
+    
+    def __init__(self, cpu_threshold=85.0, memory_threshold=85.0, check_interval=10):
+        self.cpu_threshold = cpu_threshold
+        self.memory_threshold = memory_threshold
+        self.check_interval = check_interval
+        self.cpu_history = deque(maxlen=5)  # Keep last 5 measurements
+        self.memory_history = deque(maxlen=5)
+        self.monitoring = False
+        self.monitor_thread = None
+        self.resource_queue = queue.Queue()
+        
+    def start_monitoring(self):
+        """Start background resource monitoring."""
+        if not self.monitoring:
+            self.monitoring = True
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            logging.info("Resource monitoring started")
+    
+    def stop_monitoring(self):
+        """Stop background resource monitoring."""
+        self.monitoring = False
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5)
+        logging.info("Resource monitoring stopped")
+    
+    def _monitor_loop(self):
+        """Background monitoring loop."""
+        while self.monitoring:
+            try:
+                cpu_percent = psutil.cpu_percent(interval=1)
+                memory_percent = psutil.virtual_memory().percent
+                
+                self.cpu_history.append(cpu_percent)
+                self.memory_history.append(memory_percent)
+                
+                # Put current stats in queue for main thread
+                self.resource_queue.put({
+                    'cpu': cpu_percent,
+                    'memory': memory_percent,
+                    'timestamp': time.time()
+                })
+                
+                time.sleep(self.check_interval)
+            except Exception as e:
+                logging.warning(f"Resource monitoring error: {e}")
+                time.sleep(self.check_interval)
+    
+    def get_current_usage(self):
+        """Get current resource usage."""
+        return {
+            'cpu': psutil.cpu_percent(interval=0.1),
+            'memory': psutil.virtual_memory().percent
+        }
+    
+    def get_average_usage(self):
+        """Get average resource usage from recent history."""
+        if not self.cpu_history or not self.memory_history:
+            return self.get_current_usage()
+        
+        return {
+            'cpu': sum(self.cpu_history) / len(self.cpu_history),
+            'memory': sum(self.memory_history) / len(self.memory_history)
+        }
+    
+    def recommend_workers(self, current_workers, min_workers=1, max_workers=None, scaling_factor=0.7):
+        """
+        Recommend number of workers based on current resource usage.
+        
+        Args:
+            current_workers: Current number of active workers
+            min_workers: Minimum workers to maintain
+            max_workers: Maximum workers allowed
+            scaling_factor: Factor for scaling adjustments
+        
+        Returns:
+            Recommended number of workers
+        """
+        if max_workers is None:
+            max_workers = multiprocessing.cpu_count()
+        
+        usage = self.get_average_usage()
+        cpu_usage = usage['cpu']
+        memory_usage = usage['memory']
+        
+        # Determine if we should scale up or down
+        if cpu_usage > self.cpu_threshold or memory_usage > self.memory_threshold:
+            # High resource usage - scale down
+            new_workers = max(min_workers, int(current_workers * scaling_factor))
+            action = "scale_down"
+            reason = f"High usage: CPU={cpu_usage:.1f}%, Memory={memory_usage:.1f}%"
+        elif cpu_usage < self.cpu_threshold * 0.6 and memory_usage < self.memory_threshold * 0.6:
+            # Low resource usage - consider scaling up
+            new_workers = min(max_workers, current_workers + 1)
+            action = "scale_up"
+            reason = f"Low usage: CPU={cpu_usage:.1f}%, Memory={memory_usage:.1f}%"
+        else:
+            # Moderate usage - maintain current level
+            new_workers = current_workers
+            action = "maintain"
+            reason = f"Moderate usage: CPU={cpu_usage:.1f}%, Memory={memory_usage:.1f}%"
+        
+        return {
+            'recommended_workers': new_workers,
+            'current_workers': current_workers,
+            'action': action,
+            'reason': reason,
+            'cpu_usage': cpu_usage,
+            'memory_usage': memory_usage
+        }
+
+
+def log_resource_usage():
+    """Log current system resource usage."""
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        logging.info(f"System Resources - CPU: {cpu_percent:.1f}%, "
+                    f"Memory: {memory.percent:.1f}% ({memory.used/1024**3:.1f}GB/"
+                    f"{memory.total/1024**3:.1f}GB), "
+                    f"Disk: {disk.percent:.1f}%")
+    except Exception as e:
+        logging.warning(f"Could not log resource usage: {e}")
+
+
+def init_worker():
+    """Initialize worker process for multiprocessing pools."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
 
 def load_uniprot_mapping(mapping_file):
     """
@@ -342,6 +509,246 @@ def load_cavity_mapping(mapping_file, pdbqt_mapping_file=None):
     except Exception as e:
         logging.critical(f"Error loading cavity mapping file: {e}")
         sys.exit(1)
+
+def run_stage_jobs_adaptive(stage_name, jobs, job_function, resource_monitor=None):
+    """
+    Run jobs with real-time adaptive parallelism based on CPU availability.
+    Submits jobs one-by-one when CPU capacity is available, accounting for exhaustiveness.
+    
+    Args:
+        stage_name: Name of the docking stage
+        jobs: List of jobs to execute
+        job_function: Function to execute each job
+        resource_monitor: ResourceMonitor instance for adaptive scaling
+    
+    Returns:
+        Statistics dictionary compatible with run_stage_jobs
+    """
+    if not ENABLE_DYNAMIC_RESOURCE_MANAGEMENT or resource_monitor is None:
+        # Fall back to legacy function with proper parameters
+        return run_stage_jobs(
+            job_data_list=jobs,
+            stage_name=stage_name,
+            job_function=job_function,
+            max_workers=SMINA_MAX_PARALLEL_JOBS,
+            timeout=SMINA_TIMEOUT,
+            exhaustiveness=SMINA_EXHAUSTIVENESS
+        )
+    
+    # Determine CPU cores per job based on stage configuration
+    total_cpu_cores = 64  # Your system has 64 cores
+    if "smina" in stage_name.lower():
+        cores_per_job = SMINA_EXHAUSTIVENESS if not USE_ADAPTIVE_EXHAUSTIVENESS else 16  # Conservative estimate for adaptive
+        timeout = SMINA_TIMEOUT
+        exhaustiveness = SMINA_EXHAUSTIVENESS
+    elif "gold" in stage_name.lower():
+        cores_per_job = 1  # Gold is single-threaded, uses 1 CPU core per job
+        timeout = GOLD_TIMEOUT
+        exhaustiveness = GOLD_EXHAUSTIVENESS  # Will be ignored by Gold, but kept for compatibility
+    elif "ledock" in stage_name.lower():
+        cores_per_job = 1  # LeDock is single-threaded, uses 1 CPU core per job  
+        timeout = LEDOCK_TIMEOUT
+        exhaustiveness = LEDOCK_EXHAUSTIVENESS  # Will be ignored by LeDock, but kept for compatibility
+    else:
+        cores_per_job = 1  # Default for single-threaded tools
+        timeout = 600
+        exhaustiveness = 8
+    
+    # Calculate theoretical maximum concurrent jobs based on CPU cores
+    theoretical_max_jobs = max(1, total_cpu_cores // cores_per_job)
+    # Be conservative - use 75% of theoretical maximum
+    safe_max_jobs = max(1, int(theoretical_max_jobs * 0.75))
+    
+    logging.info(f"Starting real-time adaptive execution for {stage_name} with {len(jobs)} jobs")
+    if "smina" in stage_name.lower():
+        logging.info(f"Smina cores per job: {cores_per_job} (exhaustiveness={SMINA_EXHAUSTIVENESS}), Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
+    else:
+        logging.info(f"Estimated cores per job: {cores_per_job} (exhaustiveness not applicable), Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
+    logging.info(f"Target CPU utilization: Keep below {CPU_THRESHOLD}%")
+    
+    resource_monitor.start_monitoring()
+    
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        total_jobs = len(jobs)
+        remaining_jobs = jobs.copy()
+        completed_jobs = 0
+        failed_jobs = 0
+        skipped_jobs = 0
+        timeout_jobs = 0
+        stage_start_time = time.time()
+        
+        # Track active jobs with a ThreadPoolExecutor for non-blocking submission
+        active_futures = {}  # future -> job_data mapping
+        last_resource_check = time.time()
+        resource_check_interval = 3.0  # Check every 3 seconds
+        last_submission_time = 0
+        min_submission_interval = 5.0  # Wait at least 5 seconds between submissions
+        
+        # Initial resource check
+        log_resource_usage()
+        
+        with ThreadPoolExecutor(max_workers=safe_max_jobs) as executor:
+            while remaining_jobs or active_futures:
+                current_time = time.time()
+                
+                # Check if we should submit new jobs based on CPU availability
+                if (remaining_jobs and 
+                    current_time - last_resource_check >= resource_check_interval and
+                    current_time - last_submission_time >= min_submission_interval):
+                    
+                    cpu_usage = psutil.cpu_percent(interval=1.0)  # Longer interval for more stable reading
+                    memory_usage = psutil.virtual_memory().percent
+                    current_active = len(active_futures)
+                    
+                    # Calculate estimated CPU usage if we add one more job
+                    estimated_cores_used = current_active * cores_per_job
+                    additional_cores_needed = cores_per_job
+                    total_estimated_cores = estimated_cores_used + additional_cores_needed
+                    estimated_cpu_usage_if_submit = (total_estimated_cores / total_cpu_cores) * 100
+                    
+                    # Conservative submission criteria:
+                    # 1. Current CPU usage is below threshold
+                    # 2. Adding one more job won't exceed theoretical capacity
+                    # 3. Memory usage is acceptable
+                    # 4. We haven't exceeded our safe maximum
+                    can_submit = (
+                        cpu_usage < CPU_THRESHOLD and 
+                        memory_usage < MEMORY_THRESHOLD and 
+                        current_active < safe_max_jobs and
+                        estimated_cpu_usage_if_submit < 90 and  # Don't exceed 90% theoretical usage
+                        total_estimated_cores <= total_cpu_cores
+                    )
+                    
+                    if can_submit:
+                        # Submit a new job
+                        job_data = remaining_jobs.pop(0)
+                        
+                        # Add timeout and exhaustiveness to job data
+                        job_data_copy = job_data.copy()
+                        job_data_copy['timeout'] = timeout
+                        job_data_copy['exhaustiveness'] = exhaustiveness
+                        
+                        future = executor.submit(job_function, job_data_copy)
+                        active_futures[future] = job_data
+                        last_submission_time = current_time
+                        
+                        logging.info(f"Submitted job {job_data['job_idx']}: "
+                                   f"CPU={cpu_usage:.1f}%, Active={current_active+1}/{safe_max_jobs}, "
+                                   f"Est.cores={total_estimated_cores}/{total_cpu_cores}, "
+                                   f"Remaining={len(remaining_jobs)}")
+                    else:
+                        # Log why we can't submit
+                        if cpu_usage >= CPU_THRESHOLD:
+                            reason = f"CPU too high ({cpu_usage:.1f}% >= {CPU_THRESHOLD}%)"
+                        elif current_active >= safe_max_jobs:
+                            reason = f"At max concurrent jobs ({current_active}/{safe_max_jobs})"
+                        elif estimated_cpu_usage_if_submit >= 90:
+                            reason = f"Would exceed CPU capacity ({estimated_cpu_usage_if_submit:.1f}%)"
+                        else:
+                            reason = f"Memory too high ({memory_usage:.1f}%)"
+                        
+                        if current_time - last_resource_check >= 30:  # Log every 30 seconds when waiting
+                            logging.info(f"Waiting to submit: {reason}. Active: {current_active}, "
+                                       f"CPU: {cpu_usage:.1f}%, Est.cores: {estimated_cores_used}/{total_cpu_cores}")
+                    
+                    last_resource_check = current_time
+                
+                # Process completed jobs (non-blocking)
+                completed_futures = []
+                for future in active_futures:
+                    if future.done():
+                        completed_futures.append(future)
+                
+                for future in completed_futures:
+                    job_data = active_futures.pop(future)
+                    try:
+                        result = future.result()
+                        if result['success']:
+                            if result['action'] == 'skipped':
+                                skipped_jobs += 1
+                            else:
+                                completed_jobs += 1
+                        else:
+                            if result['action'] == 'timeout':
+                                timeout_jobs += 1
+                            else:
+                                failed_jobs += 1
+                        
+                        # Log progress every 5 completed jobs
+                        total_processed = completed_jobs + failed_jobs + skipped_jobs + timeout_jobs
+                        if total_processed % 5 == 0:
+                            progress_pct = (total_processed / total_jobs) * 100
+                            logging.info(f"{stage_name} progress: {total_processed}/{total_jobs} "
+                                       f"({progress_pct:.1f}%) - Active: {len(active_futures)}")
+                            log_resource_usage()
+                        
+                    except Exception as e:
+                        failed_jobs += 1
+                        logging.error(f"Job {job_data['job_idx']} failed with exception: {e}")
+                
+                # Small sleep to prevent busy waiting
+                time.sleep(0.5)
+        
+        stage_elapsed_time = time.time() - stage_start_time
+        total_processed = completed_jobs + failed_jobs + skipped_jobs + timeout_jobs
+        
+        logging.info(f"Real-time adaptive {stage_name} completed in {stage_elapsed_time/60:.1f} minutes:")
+        logging.info(f"  Completed: {completed_jobs}, Failed: {failed_jobs}, "
+                    f"Skipped: {skipped_jobs}, Timeout: {timeout_jobs}")
+        logging.info(f"  Total processed: {total_processed}/{total_jobs}")
+        
+        # Return stats in expected format for compatibility
+        return {
+            'completed': completed_jobs,
+            'failed': failed_jobs,
+            'skipped': skipped_jobs,
+            'timeout': timeout_jobs,
+            'elapsed_time': stage_elapsed_time,
+            'unique_processes': safe_max_jobs
+        }
+        
+    finally:
+        resource_monitor.stop_monitoring()
+
+
+def clean_smina_results_only(output_folder):
+    """
+    Clean only Smina results and final results from an output folder,
+    preserving Gold and LeDock results.
+    
+    Args:
+        output_folder (str): Path to the docking output folder
+        
+    Returns:
+        bool: True if cleaning was successful, False otherwise
+    """
+    try:
+        # Remove Smina subfolder if it exists
+        smina_folder = os.path.join(output_folder, 'smina')
+        if os.path.exists(smina_folder):
+            shutil.rmtree(smina_folder)
+            logging.debug(f"Removed Smina results folder: {smina_folder}")
+        
+        # Remove final results file to force recalculation
+        final_results_file = os.path.join(output_folder, 'final_results.csv')
+        if os.path.exists(final_results_file):
+            os.remove(final_results_file)
+            logging.debug(f"Removed final results file: {final_results_file}")
+        
+        # Also remove any other final result variants
+        for filename in ['results.csv', 'consensus_results.csv']:
+            file_path = os.path.join(output_folder, filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logging.debug(f"Removed results file: {file_path}")
+        
+        return True
+        
+    except Exception as e:
+        logging.warning(f"Error cleaning Smina results from {output_folder}: {e}")
+        return False
 
 def check_tool_completion(output_folder, tool_name):
     """
@@ -563,14 +970,21 @@ def run_single_smina_job(job_data):
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
     EXHAUSTIVENESS = job_data.get('exhaustiveness', 8)  # Default to 8 if not set
+    USE_ADAPTIVE_EXHAUSTIVENESS = job_data.get('use_adaptive_exhaustiveness', False)
+    UPDATE_SMINA_ONLY = job_data.get('update_smina_only', False)
     
     process_id = os.getpid()
     
     try:
-        # Check if smina output already exists
+        # If UPDATE_SMINA_ONLY mode, clean existing Smina results first
+        if UPDATE_SMINA_ONLY:
+            clean_smina_results_only(current_outfolder)
+            logging.info(f"Job {job_idx}: Cleaned existing Smina results for update mode")
+        
+        # Check if smina output already exists (after potential cleaning)
         smina_completion = check_tool_completion(current_outfolder, 'smina')
         logging.info(f"Job {job_idx}: Smina completion check: {smina_completion} for {current_outfolder}")
-        if smina_completion:
+        if smina_completion and not UPDATE_SMINA_ONLY:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -595,9 +1009,20 @@ def run_single_smina_job(job_data):
             "--receptor_pdb", receptor_pdb,
             "--pocket_pdb", pocket_pdb,
             "--num_threads", str(NUM_THREADS),
-            "--cutoff_value", str(CUTOFF_VALUE),
-            "--exhaustiveness", str(EXHAUSTIVENESS)
+            "--cutoff_value", str(CUTOFF_VALUE)
         ]
+        
+        # Skip RMSD calculation if USE_RMSD_CALCULATION is False
+        if not job_data.get('use_rmsd_calculation', True):
+            command.append("--skip_rmsd")
+        
+        # Add adaptive exhaustiveness or regular exhaustiveness
+        if USE_ADAPTIVE_EXHAUSTIVENESS:
+            command.append("--adaptive_exhaustiveness")
+            logging.debug(f"Job {job_idx}: Using adaptive exhaustiveness for Smina")
+        else:
+            command.extend(["--exhaustiveness", str(EXHAUSTIVENESS)])
+            logging.debug(f"Job {job_idx}: Using fixed exhaustiveness {EXHAUSTIVENESS} for Smina")
         
         # Add PDBQT file if available for faster processing
         if receptor_pdbqt and os.path.exists(receptor_pdbqt):
@@ -624,6 +1049,7 @@ def run_single_smina_job(job_data):
             }
         
         if returncode == 0:
+            action_type = 'updated' if UPDATE_SMINA_ONLY else 'completed'
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -632,8 +1058,8 @@ def run_single_smina_job(job_data):
                 'gene_name': gene_name,
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
-                'action': 'completed',
-                'message': f'Successfully completed smina docking for {drugbank_id} into {pocket_pdb}',
+                'action': action_type,
+                'message': f'Successfully {action_type} smina docking for {drugbank_id} into {pocket_pdb}',
                 'process_id': process_id
             }
         else:
@@ -730,6 +1156,10 @@ def run_single_gold_job(job_data):
             "--cutoff_value", str(CUTOFF_VALUE),
             "--exhaustiveness", str(EXHAUSTIVENESS)
         ]
+        
+        # Skip RMSD calculation if USE_RMSD_CALCULATION is False
+        if not job_data.get('use_rmsd_calculation', True):
+            command.append("--skip_rmsd")
         
         # Add PDBQT file if available for faster processing
         if receptor_pdbqt and os.path.exists(receptor_pdbqt):
@@ -865,6 +1295,10 @@ def run_single_ledock_job(job_data):
             "--exhaustiveness", str(EXHAUSTIVENESS)
         ]
         
+        # Skip RMSD calculation if USE_RMSD_CALCULATION is False
+        if not job_data.get('use_rmsd_calculation', True):
+            command.append("--skip_rmsd")
+        
         # Add PDBQT file if available for faster processing
         if receptor_pdbqt and os.path.exists(receptor_pdbqt):
             command.extend(["--receptor_pdbqt", receptor_pdbqt])
@@ -961,12 +1395,22 @@ def run_single_rmsd_job(job_data):
     CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
     NUM_THREADS = job_data['num_threads']
     CUTOFF_VALUE = job_data['cutoff_value']
+    FORCE_RMSD_RECALCULATION = job_data.get('force_rmsd_recalculation', False)
     
     process_id = os.getpid()
     
     try:
-        # Check if final results already exist
-        if check_final_results_completion(current_outfolder):
+        # If FORCE_RMSD_RECALCULATION is True, remove existing final results
+        if FORCE_RMSD_RECALCULATION:
+            final_results_file = os.path.join(current_outfolder, 'final_results.csv')
+            if os.path.exists(final_results_file):
+                os.remove(final_results_file)
+                logging.debug(f"Removed final results file for recalculation: {final_results_file}")
+                os.remove(final_results_file)
+                logging.debug(f"Job {job_idx}: Removed existing final results for forced recalculation")
+        
+        # Check if final results already exist (after potential removal)
+        if check_final_results_completion(current_outfolder) and not FORCE_RMSD_RECALCULATION:
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -980,10 +1424,10 @@ def run_single_rmsd_job(job_data):
                 'process_id': process_id
             }
         
-        # Build the RMSD-only command (run consensus docker with skip flags to only calculate RMSD)
+        # Build the RMSD calculation command (run with minimal docking tools to trigger RMSD calculation)
+        # Since there's no --skip_docking flag, we'll run with minimal setup to just calculate RMSD
         command = [
             "python", CONSENSUS_DOCKER_SCRIPT,
-            "--skip_docking",  # Skip actual docking, only calculate RMSD
             "--overwrite",  # Allow writing to existing directory
             "--outfolder", current_outfolder,
             "--ligand_sdf", ligand_sdf,
@@ -991,6 +1435,7 @@ def run_single_rmsd_job(job_data):
             "--pocket_pdb", pocket_pdb,
             "--num_threads", str(NUM_THREADS),
             "--cutoff_value", str(CUTOFF_VALUE)
+            # Note: No docking tool flags specified, so it should only do RMSD calculation
         ]
         
         # Add PDBQT file if available
@@ -1018,6 +1463,7 @@ def run_single_rmsd_job(job_data):
             }
         
         if returncode == 0:
+            action_type = 'recalculated' if FORCE_RMSD_RECALCULATION else 'completed'
             return {
                 'success': True,
                 'job_idx': job_idx,
@@ -1026,8 +1472,8 @@ def run_single_rmsd_job(job_data):
                 'gene_name': gene_name,
                 'pocket_pdb': pocket_pdb,
                 'current_outfolder': current_outfolder,
-                'action': 'completed',
-                'message': f'Successfully completed RMSD calculation for {drugbank_id} into {pocket_pdb}',
+                'action': action_type,
+                'message': f'Successfully {action_type} RMSD calculation for {drugbank_id} into {pocket_pdb}',
                 'process_id': process_id
             }
         else:
@@ -1341,8 +1787,15 @@ def run_docking(
     logging.info(f"Stage 1 - Smina: {'ENABLED' if USE_SMINA else 'DISABLED'}")
     if USE_SMINA:
         logging.info(f"  - Max parallel jobs: {SMINA_MAX_PARALLEL_JOBS}")
-        logging.info(f"  - Exhaustiveness: {SMINA_EXHAUSTIVENESS}")
+        if USE_ADAPTIVE_EXHAUSTIVENESS:
+            logging.info(f"  - Exhaustiveness: ADAPTIVE (convergence-based)")
+        else:
+            logging.info(f"  - Exhaustiveness: {SMINA_EXHAUSTIVENESS} (fixed)")
         logging.info(f"  - Timeout: {SMINA_TIMEOUT/60:.1f} minutes")
+        if UPDATE_SMINA_ONLY:
+            logging.info(f"  - Mode: UPDATE EXISTING (preserve Gold/LeDock results)")
+        else:
+            logging.info(f"  - Mode: NORMAL")
     
     logging.info(f"Stage 2 - Gold: {'ENABLED' if USE_GOLD else 'DISABLED'}")
     if USE_GOLD:
@@ -1360,6 +1813,10 @@ def run_docking(
     if USE_RMSD_CALCULATION:
         logging.info(f"  - Max parallel jobs: {RMSD_MAX_PARALLEL_JOBS}")
         logging.info(f"  - Timeout: {RMSD_TIMEOUT/60:.1f} minutes")
+        if FORCE_RMSD_RECALCULATION:
+            logging.info(f"  - Mode: FORCE RECALCULATION")
+        else:
+            logging.info(f"  - Mode: NORMAL")
     
     logging.info("=" * 40)
     
@@ -1410,14 +1867,18 @@ def run_docking(
             'receptor_pdbqt': receptor_pdbqt,
             'pocket_pdb': pocket_pdb,
             'current_outfolder': current_outfolder,
-            # Configuration parameters
             'consensus_docker_script': CONSENSUS_DOCKER_SCRIPT,
             'smina_path': SMINA_PATH,
             'ledock_path': LEDOCK_PATH,
             'lepro_path': LEPRO_PATH,
             'gold_path': GOLD_PATH,
             'num_threads': NUM_THREADS,
-            'cutoff_value': CUTOFF_VALUE
+            'cutoff_value': CUTOFF_VALUE,
+            # New adaptive exhaustiveness and update mode parameters
+            'use_adaptive_exhaustiveness': USE_ADAPTIVE_EXHAUSTIVENESS,
+            'update_smina_only': UPDATE_SMINA_ONLY,
+            'force_rmsd_recalculation': FORCE_RMSD_RECALCULATION,
+            'use_rmsd_calculation': USE_RMSD_CALCULATION
         }
         job_data_list.append(job_data)
     
@@ -1433,13 +1894,26 @@ def run_docking(
     # === STAGE 1: RUN SMINA DOCKING ===
     if USE_SMINA:
         logging.info("Stage 1: Smina docking is ENABLED")
-        stage1_stats = run_stage_jobs(
-            job_data_list=job_data_list, 
+        
+        # Initialize resource monitor for adaptive execution
+        resource_monitor = None
+        if ENABLE_DYNAMIC_RESOURCE_MANAGEMENT:
+            resource_monitor = ResourceMonitor(
+                cpu_threshold=CPU_THRESHOLD,
+                memory_threshold=MEMORY_THRESHOLD,
+                check_interval=RESOURCE_CHECK_INTERVAL
+            )
+            logging.info("Dynamic resource management ENABLED for Smina stage")
+            logging.info(f"Resource thresholds - CPU: {CPU_THRESHOLD}%, Memory: {MEMORY_THRESHOLD}%")
+        else:
+            logging.info("Dynamic resource management DISABLED - using fixed parallelism")
+        
+        # Use adaptive execution for Smina stage
+        stage1_stats = run_stage_jobs_adaptive(
             stage_name="Stage 1: Smina Docking", 
+            jobs=job_data_list,
             job_function=run_single_smina_job,
-            max_workers=SMINA_MAX_PARALLEL_JOBS,
-            timeout=SMINA_TIMEOUT,
-            exhaustiveness=SMINA_EXHAUSTIVENESS
+            resource_monitor=resource_monitor
         )
     else:
         logging.info("Stage 1: Smina docking is DISABLED - skipping")
@@ -1766,4 +2240,5 @@ if __name__ == "__main__":
         logging.critical(f"Critical error in main execution: {e}")
         import traceback
         logging.critical(traceback.format_exc())
+        sys.exit(1)
         sys.exit(1)
