@@ -69,7 +69,7 @@ FIXED_MAPPING_CSV = "fixed_mapping.csv" # Preferred input from fix_required_pdbs
 ALPHAFOLD_MAPPING_CSV = "alphafold_mapping.csv" # Alternative input from extract_alphafold_models.py
 PDBQT_MAPPING_CSV = "pdbqt_mapping.csv" # Input file from convert_pdb_to_pdbqt.py (optional)
 LOG_FILE = "docking_automation.log"
-# --- TEST MODE: Set to True to run only 3 docking jobs for testing ---
+# --- TEST MODE: Set to True to run only a limited number of docking jobs for testing ---
 TEST_MODE = False
 MAX_TEST_JOBS = 40
 # --- CONFIRMATION PROMPT: Set to True to skip user confirmation when not in TEST_MODE ---
@@ -82,7 +82,8 @@ USE_LEDOCK = False               # Enable/disable LeDock docking
 USE_RMSD_CALCULATION = False     # Enable/disable final RMSD calculation
 
 # --- ADAPTIVE EXHAUSTIVENESS AND UPDATE MODE ---
-USE_ADAPTIVE_EXHAUSTIVENESS = True  # Use adaptive exhaustiveness for Smina (new feature)
+USE_ADAPTIVE_EXHAUSTIVENESS = False  # Use adaptive exhaustiveness for Smina (new feature)
+MAX_EXHAUSTIVENESS = 24             # Maximum exhaustiveness when adaptive mode is enabled
 UPDATE_SMINA_ONLY = True            # If True, only update Smina results, preserve Gold/LeDock
 FORCE_RMSD_RECALCULATION = True     # If True, force RMSD recalculation even if final results exist
 
@@ -90,19 +91,19 @@ FORCE_RMSD_RECALCULATION = True     # If True, force RMSD recalculation even if 
 # NEW: Real-time job submission based on CPU availability (no batching)
 # Optimized for 64-core systems: submits jobs one-by-one when CPU < threshold
 # Takes into account actual CPU cores used per job (exhaustiveness parameter)
-ENABLE_DYNAMIC_RESOURCE_MANAGEMENT = True  # Enable adaptive parallelism based on system load
-CPU_THRESHOLD = 60.0                       # Submit new jobs only when CPU < this % 
+ENABLE_DYNAMIC_RESOURCE_MANAGEMENT = False  # Enable adaptive parallelism based on system load
+CPU_THRESHOLD = 80.0                       # Submit new jobs only when CPU < this % (increased from 60%)
 MEMORY_THRESHOLD = 85.0                    # Reduce parallelism if memory usage exceeds this %
 RESOURCE_CHECK_INTERVAL = 2               # Check system resources every N seconds (faster for real-time)
 MIN_PARALLEL_JOBS = 1                      # Minimum number of parallel jobs
-MAX_PARALLEL_JOBS_ADAPTIVE = 4             # Conservative maximum (will be calculated based on exhaustiveness)
+MAX_PARALLEL_JOBS_ADAPTIVE = 3             # Conservative maximum (will be calculated based on exhaustiveness)
 ADAPTIVE_SCALING_FACTOR = 0.8              # Factor to reduce jobs when resources are high
 
 # --- THREE-STAGE DOCKING CONFIGURATION ---
 # Stage 1: Smina only (high exhaustiveness = high CPU usage per job, low parallelism)
-SMINA_MAX_PARALLEL_JOBS = 4     # Maximum parallel jobs for smina stage
-SMINA_EXHAUSTIVENESS = 16       # High exhaustiveness for smina (CPU cores used per job)
-SMINA_TIMEOUT = 3000           # Timeout for smina jobs in seconds (50 minutes)
+SMINA_MAX_PARALLEL_JOBS = 2     # Maximum parallel jobs for smina stage
+SMINA_EXHAUSTIVENESS = 32       # High exhaustiveness for smina (CPU cores used per job)
+SMINA_TIMEOUT = 300           # Timeout for smina jobs in seconds (5 minutes)
 # Stage 2: Gold (single-threaded, high parallelism possible)
 GOLD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for gold stage
 GOLD_EXHAUSTIVENESS = 12        # Kept for compatibility but ignored by Gold (single-threaded)
@@ -191,6 +192,8 @@ logging.info(f"USE_RMSD_CALCULATION: {USE_RMSD_CALCULATION}")
 if not USE_RMSD_CALCULATION:
     logging.info("*** RMSD CALCULATION DISABLED - Using --skip_rmsd flag for all docking tools ***")
 logging.info(f"USE_ADAPTIVE_EXHAUSTIVENESS: {USE_ADAPTIVE_EXHAUSTIVENESS}")
+if USE_ADAPTIVE_EXHAUSTIVENESS:
+    logging.info(f"MAX_EXHAUSTIVENESS: {MAX_EXHAUSTIVENESS} (caps CPU usage when adaptive mode enabled)")
 logging.info(f"UPDATE_SMINA_ONLY: {UPDATE_SMINA_ONLY}")
 logging.info(f"FORCE_RMSD_RECALCULATION: {FORCE_RMSD_RECALCULATION}")
 logging.info(f"TEST_MODE: {TEST_MODE}")
@@ -538,7 +541,10 @@ def run_stage_jobs_adaptive(stage_name, jobs, job_function, resource_monitor=Non
     # Determine CPU cores per job based on stage configuration
     total_cpu_cores = 64  # Your system has 64 cores
     if "smina" in stage_name.lower():
-        cores_per_job = SMINA_EXHAUSTIVENESS if not USE_ADAPTIVE_EXHAUSTIVENESS else 16  # Conservative estimate for adaptive
+        if USE_ADAPTIVE_EXHAUSTIVENESS:
+            cores_per_job = MAX_EXHAUSTIVENESS  # Use max exhaustiveness for conservative resource planning
+        else:
+            cores_per_job = SMINA_EXHAUSTIVENESS  # Use fixed exhaustiveness
         timeout = SMINA_TIMEOUT
         exhaustiveness = SMINA_EXHAUSTIVENESS
     elif "gold" in stage_name.lower():
@@ -556,12 +562,15 @@ def run_stage_jobs_adaptive(stage_name, jobs, job_function, resource_monitor=Non
     
     # Calculate theoretical maximum concurrent jobs based on CPU cores
     theoretical_max_jobs = max(1, total_cpu_cores // cores_per_job)
-    # Be conservative - use 75% of theoretical maximum
-    safe_max_jobs = max(1, int(theoretical_max_jobs * 0.75))
+    # Be more aggressive - use 95% of theoretical maximum to allow more parallel jobs
+    safe_max_jobs = max(1, int(theoretical_max_jobs * 0.95))
     
     logging.info(f"Starting real-time adaptive execution for {stage_name} with {len(jobs)} jobs")
     if "smina" in stage_name.lower():
-        logging.info(f"Smina cores per job: {cores_per_job} (exhaustiveness={SMINA_EXHAUSTIVENESS}), Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
+        if USE_ADAPTIVE_EXHAUSTIVENESS:
+            logging.info(f"Smina adaptive mode: max {MAX_EXHAUSTIVENESS} cores per job, Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
+        else:
+            logging.info(f"Smina fixed mode: {cores_per_job} cores per job (exhaustiveness={SMINA_EXHAUSTIVENESS}), Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
     else:
         logging.info(f"Estimated cores per job: {cores_per_job} (exhaustiveness not applicable), Theoretical max concurrent: {theoretical_max_jobs}, Safe max: {safe_max_jobs}")
     logging.info(f"Target CPU utilization: Keep below {CPU_THRESHOLD}%")
@@ -629,6 +638,10 @@ def run_stage_jobs_adaptive(stage_name, jobs, job_function, resource_monitor=Non
                         job_data_copy = job_data.copy()
                         job_data_copy['timeout'] = timeout
                         job_data_copy['exhaustiveness'] = exhaustiveness
+                        job_data_copy['use_adaptive_exhaustiveness'] = USE_ADAPTIVE_EXHAUSTIVENESS
+                        job_data_copy['max_exhaustiveness'] = MAX_EXHAUSTIVENESS
+                        job_data_copy['update_smina_only'] = UPDATE_SMINA_ONLY
+                        job_data_copy['use_rmsd_calculation'] = USE_RMSD_CALCULATION
                         
                         future = executor.submit(job_function, job_data_copy)
                         active_futures[future] = job_data
@@ -1019,7 +1032,8 @@ def run_single_smina_job(job_data):
         # Add adaptive exhaustiveness or regular exhaustiveness
         if USE_ADAPTIVE_EXHAUSTIVENESS:
             command.append("--adaptive_exhaustiveness")
-            logging.debug(f"Job {job_idx}: Using adaptive exhaustiveness for Smina")
+            command.extend(["--maximum_exhaustiveness", str(job_data.get('max_exhaustiveness', MAX_EXHAUSTIVENESS))])
+            logging.debug(f"Job {job_idx}: Using adaptive exhaustiveness for Smina with max {job_data.get('max_exhaustiveness', MAX_EXHAUSTIVENESS)}")
         else:
             command.extend(["--exhaustiveness", str(EXHAUSTIVENESS)])
             logging.debug(f"Job {job_idx}: Using fixed exhaustiveness {EXHAUSTIVENESS} for Smina")
