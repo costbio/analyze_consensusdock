@@ -76,10 +76,10 @@ MAX_TEST_JOBS = 40
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
 # --- DOCKING TOOLS SELECTION ---
 # Set to True to enable each docking tool, False to disable
-USE_SMINA = True                # Enable/disable Smina docking
+USE_SMINA = False                # Enable/disable Smina docking
 USE_GOLD = False                 # Enable/disable Gold docking  
 USE_LEDOCK = False               # Enable/disable LeDock docking
-USE_RMSD_CALCULATION = False     # Enable/disable final RMSD calculation
+USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
 
 # --- ADAPTIVE EXHAUSTIVENESS AND UPDATE MODE ---
 USE_ADAPTIVE_EXHAUSTIVENESS = False  # Use adaptive exhaustiveness for Smina (new feature)
@@ -1438,10 +1438,11 @@ def run_single_rmsd_job(job_data):
                 'process_id': process_id
             }
         
-        # Build the RMSD calculation command (run with minimal docking tools to trigger RMSD calculation)
-        # Since there's no --skip_docking flag, we'll run with minimal setup to just calculate RMSD
+        # Build the RMSD calculation command using the new --only_rmsd flag
+        # This flag skips all docking and only performs RMSD calculations
         command = [
             "python", CONSENSUS_DOCKER_SCRIPT,
+            "--only_rmsd",  # NEW: Skip docking, only calculate RMSD
             "--overwrite",  # Allow writing to existing directory
             "--outfolder", current_outfolder,
             "--ligand_sdf", ligand_sdf,
@@ -1449,7 +1450,6 @@ def run_single_rmsd_job(job_data):
             "--pocket_pdb", pocket_pdb,
             "--num_threads", str(NUM_THREADS),
             "--cutoff_value", str(CUTOFF_VALUE)
-            # Note: No docking tool flags specified, so it should only do RMSD calculation
         ]
         
         # Add PDBQT file if available
