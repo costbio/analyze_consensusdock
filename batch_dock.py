@@ -60,7 +60,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # --- Configuration ---
 # --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
 CONSENSUS_DOCKER_SCRIPT = "/home/onur/repos/consensus_docking/consensus_docker.py"
-PROCESSED_LIGAND_SDF_FOLDER = "/media/onur/Elements/cavity_space_consensus_docking/drugbank_approved_split" # The output folder from your RDKit 3D processing script
+PROCESSED_LIGAND_SDF_FOLDER = "/opt/data/drugbank/drugbank_approved_split" # The output folder from your RDKit 3D processing script
 DRUG_TO_PROTEIN_TSV = "/opt/data/multiscale_interactome_data/1_drug_to_protein.tsv"
 SMALL_MOLECULE_DRUGS_CSV = "/opt/data/drugbank/small_molecule_drug_links.csv"  # Small molecule drugs only
 UNIPROT_MAPPING_CSV = "uniprot_gene_mapping.csv" # Input file from prepare_uniprot_mapping.py
@@ -68,6 +68,7 @@ CAVITY_MAPPING_CSV = "cavity_mapping.csv" # Input file from extract_cavities.py
 FIXED_MAPPING_CSV = "fixed_mapping.csv" # Preferred input from fix_required_pdbs.py
 ALPHAFOLD_MAPPING_CSV = "alphafold_mapping.csv" # Alternative input from extract_alphafold_models.py
 PDBQT_MAPPING_CSV = "pdbqt_mapping.csv" # Input file from convert_pdb_to_pdbqt.py (optional)
+REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV = "required_structures_with_negatives.csv"  # Input from generate_negative_samples.py (preferred if exists)
 LOG_FILE = "docking_automation.log"
 # --- TEST MODE: Set to True to run only a limited number of docking jobs for testing ---
 TEST_MODE = False
@@ -76,16 +77,16 @@ MAX_TEST_JOBS = 40
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
 # --- DOCKING TOOLS SELECTION ---
 # Set to True to enable each docking tool, False to disable
-USE_SMINA = False                # Enable/disable Smina docking
-USE_GOLD = False                 # Enable/disable Gold docking  
-USE_LEDOCK = False               # Enable/disable LeDock docking
+USE_SMINA = True                # Enable/disable Smina docking
+USE_GOLD = True                 # Enable/disable Gold docking  
+USE_LEDOCK = True               # Enable/disable LeDock docking
 USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
 
 # --- ADAPTIVE EXHAUSTIVENESS AND UPDATE MODE ---
 USE_ADAPTIVE_EXHAUSTIVENESS = False  # Use adaptive exhaustiveness for Smina (new feature)
 MAX_EXHAUSTIVENESS = 24             # Maximum exhaustiveness when adaptive mode is enabled
-UPDATE_SMINA_ONLY = True            # If True, only update Smina results, preserve Gold/LeDock
-FORCE_RMSD_RECALCULATION = True     # If True, force RMSD recalculation even if final results exist
+UPDATE_SMINA_ONLY = False            # If True, only update Smina results, preserve Gold/LeDock
+FORCE_RMSD_RECALCULATION = False     # If True, force RMSD recalculation even if final results exist
 
 # --- DYNAMIC RESOURCE MANAGEMENT ---
 # NEW: Real-time job submission based on CPU availability (no batching)
@@ -391,6 +392,84 @@ def load_small_molecule_drugs():
         return small_molecule_ids
     except Exception as e:
         logging.critical(f"Error loading small molecule drugs: {e}")
+        sys.exit(1)
+
+def load_drug_target_combinations():
+    """
+    Load drug-target combinations from the best available source.
+    
+    Priority:
+    1. required_structures_with_negatives.csv (from generate_negative_samples.py)
+       - Contains explicit drug-target-pocket combinations for both positive and negative samples
+       - Most specific: includes exact cavities to dock
+    2. DRUG_TO_PROTEIN_TSV (known interactions only)
+       - Contains only known positive interactions
+       - Will dock all available cavities for each target
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns compatible with run_docking()
+        str: Source file used
+        bool: Whether explicit cavity information is available
+    """
+    # Check for required_structures_with_negatives.csv first (preferred)
+    if os.path.exists(REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV):
+        logging.info(f"Found {REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV} - using explicit drug-target-pocket combinations")
+        try:
+            df = pd.read_csv(REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV)
+            
+            # Validate required columns
+            required_columns = ['UniProt_ID', 'drugbank_id', 'Cavity_Index', 'sample_type']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logging.error(f"Required columns missing from {REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV}: {missing_columns}")
+                logging.info("Falling back to DRUG_TO_PROTEIN_TSV...")
+            else:
+                # Transform to format expected by run_docking
+                # Add Gene_Name if not present (optional, for logging purposes)
+                if 'Gene_Name' not in df.columns:
+                    df['Gene_Name'] = ''
+                
+                # Rename columns to match expected format
+                transformed_df = df.rename(columns={
+                    'drugbank_id': 'node_1',
+                    'Gene_Name': 'node_2_name'
+                })
+                
+                # Add UniProt_ID and Cavity_Index for explicit cavity targeting
+                # Keep these columns for later use in run_docking
+                transformed_df['explicit_uniprot_id'] = df['UniProt_ID']
+                transformed_df['explicit_cavity_index'] = df['Cavity_Index']
+                transformed_df['sample_type'] = df['sample_type']
+                
+                logging.info(f"Loaded {len(transformed_df)} drug-target-pocket combinations")
+                logging.info(f"  Positive samples: {(transformed_df['sample_type'] == 'positive').sum()}")
+                logging.info(f"  Negative samples: {(transformed_df['sample_type'].str.startswith('negative')).sum()}")
+                logging.info(f"  Unique drugs: {transformed_df['node_1'].nunique()}")
+                logging.info(f"  Unique targets: {transformed_df['explicit_uniprot_id'].nunique()}")
+                
+                return transformed_df, REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV, True
+                
+        except Exception as e:
+            logging.error(f"Error loading {REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV}: {e}")
+            logging.info("Falling back to DRUG_TO_PROTEIN_TSV...")
+    
+    # Fall back to DRUG_TO_PROTEIN_TSV (original behavior)
+    logging.info(f"Using {DRUG_TO_PROTEIN_TSV} for drug-target combinations")
+    
+    if not os.path.exists(DRUG_TO_PROTEIN_TSV):
+        logging.critical(f"Drug-to-protein TSV not found: {DRUG_TO_PROTEIN_TSV}")
+        sys.exit(1)
+    
+    try:
+        df = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
+        logging.info(f"Loaded {len(df)} drug-protein interactions from TSV")
+        
+        # No explicit cavity information when using TSV
+        return df, DRUG_TO_PROTEIN_TSV, False
+        
+    except Exception as e:
+        logging.critical(f"Error loading drug-to-protein TSV: {e}")
         sys.exit(1)
 
 def load_best_mapping_with_pdbqt():
@@ -1671,13 +1750,36 @@ def run_docking(
     uniprot_map_df, 
     pdb_info_dict, 
     processed_ligand_sdf_folder,
-    output_base_folder="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/consensus_docking_results"
+    output_base_folder="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/consensus_docking_results",
+    has_explicit_cavities=False
 ):
     """
     Iterates through drug-protein pairs, constructs commands, and runs three-stage docking.
+    
+    Parameters:
+    -----------
+    drug_to_protein_df : pd.DataFrame
+        DataFrame with drug-target combinations. If has_explicit_cavities is True,
+        must contain 'explicit_uniprot_id' and 'explicit_cavity_index' columns.
+    uniprot_map_df : pd.DataFrame
+        UniProt to gene name mapping
+    pdb_info_dict : dict
+        Dictionary mapping UniProt IDs to (receptor_pdb, pocket_pdb, receptor_pdbqt) tuples
+    processed_ligand_sdf_folder : str
+        Folder containing ligand SDF files
+    output_base_folder : str
+        Output folder for docking results
+    has_explicit_cavities : bool
+        If True, use explicit cavity information from drug_to_protein_df
+        If False, dock all available cavities for each target (original behavior)
     """
     logging.info("Starting three-stage docking execution.")
     logging.info(f"Using output base folder: {output_base_folder}")
+    
+    if has_explicit_cavities:
+        logging.info("✅ Using explicit cavity information - docking only specified drug-target-pocket combinations")
+    else:
+        logging.info("Using all available cavities for each target (original behavior)")
     
     # Check if output folder exists
     if not os.path.exists(output_base_folder):
@@ -1722,11 +1824,20 @@ def run_docking(
             skipped_jobs += 1
             continue
 
-        uniprot_id = uniprot_gene_map.get(gene_name)
-        if not uniprot_id:
-            tqdm.write(f"Warning: UniProt ID not found for gene '{gene_name}'. Skipping {drugbank_id}-{gene_name} pair.")
-            skipped_jobs += 1
-            continue
+        # Determine UniProt ID
+        if has_explicit_cavities and 'explicit_uniprot_id' in row and pd.notna(row['explicit_uniprot_id']):
+            # Use explicit UniProt ID from required_structures_with_negatives.csv
+            uniprot_id = row['explicit_uniprot_id']
+            explicit_cavity_index = row.get('explicit_cavity_index', None)
+        else:
+            # Use gene name to look up UniProt ID (original behavior)
+            uniprot_id = uniprot_gene_map.get(gene_name)
+            explicit_cavity_index = None
+            
+            if not uniprot_id:
+                tqdm.write(f"Warning: UniProt ID not found for gene '{gene_name}'. Skipping {drugbank_id}-{gene_name} pair.")
+                skipped_jobs += 1
+                continue
         
         if uniprot_id not in pdb_info_dict:
             logging.debug(f"UniProt ID '{uniprot_id}' not found in cavity mapping. Gene: '{gene_name}', DrugBank: '{drugbank_id}'")
@@ -1740,6 +1851,12 @@ def run_docking(
             pocket_filename = Path(pocket_pdb).stem
             cavity_match = re.search(r'_cavity_(\d+)', pocket_filename)
             cavity_num = cavity_match.group(1) if cavity_match else "unknown"
+            
+            # If explicit cavity is specified, only dock to that specific cavity
+            if has_explicit_cavities and explicit_cavity_index is not None:
+                if int(cavity_num) != int(explicit_cavity_index):
+                    continue  # Skip this cavity, not the one we want
+            
             job_signature = f"{drugbank_id}_{uniprot_id}_{cavity_num}"
             
             total_docking_jobs += 1
@@ -2229,9 +2346,8 @@ if __name__ == "__main__":
     
     # 3. Load necessary data for docking
     try:
-        # Load drug-to-protein mapping
-        drug_to_protein_df = pd.read_csv(DRUG_TO_PROTEIN_TSV, sep='\t')
-        logging.info(f"Loaded drug-to-protein mapping with {len(drug_to_protein_df)} rows")
+        # Load drug-target combinations (from required_structures_with_negatives.csv if available)
+        drug_to_protein_df, combinations_source, has_explicit_cavities = load_drug_target_combinations()
         
         # Load UniProt mapping
         uniprot_map_df = load_uniprot_mapping(UNIPROT_MAPPING_CSV)
@@ -2242,13 +2358,24 @@ if __name__ == "__main__":
         # Load cavity mapping with PDBQT support
         pdb_info_dict, mapping_source = load_best_mapping_with_pdbqt()
         
-        # Filter drug_to_protein_df to include only small molecules
-        initial_rows = len(drug_to_protein_df)
-        drug_to_protein_df = drug_to_protein_df[drug_to_protein_df['node_1'].isin(small_molecules)]
-        logging.info(f"Filtered to {len(drug_to_protein_df)} drug-protein pairs with small molecules (from {initial_rows})")
+        # Filter drug_to_protein_df to include only small molecules (if not already filtered)
+        if not has_explicit_cavities:
+            # Original behavior: filter by small molecules
+            initial_rows = len(drug_to_protein_df)
+            drug_to_protein_df = drug_to_protein_df[drug_to_protein_df['node_1'].isin(small_molecules)]
+            logging.info(f"Filtered to {len(drug_to_protein_df)} drug-protein pairs with small molecules (from {initial_rows})")
+        else:
+            # New behavior: required_structures_with_negatives.csv already has filtered data
+            logging.info(f"Using pre-filtered drug-target combinations from {combinations_source}")
         
-        # Run the main docking workflow
-        run_docking(drug_to_protein_df, uniprot_map_df, pdb_info_dict, PROCESSED_LIGAND_SDF_FOLDER)
+        # Run the main docking workflow with explicit cavity flag
+        run_docking(
+            drug_to_protein_df, 
+            uniprot_map_df, 
+            pdb_info_dict, 
+            PROCESSED_LIGAND_SDF_FOLDER,
+            has_explicit_cavities=has_explicit_cavities
+        )
         
     except Exception as e:
         logging.critical(f"Critical error in main execution: {e}")

@@ -1,35 +1,19 @@
-# Consensus## Workflow Overview
+# Consensus Docking Analysis Workflow
 
-The docking workflow consists of seven main steps and processes **small molecule drugs only**:
-
-1. **UniProt Mapping Generation** (`prepare_uniprot_mapping.py`)
-2. **Cavity Extraction** (`extract_cavities.py`)
-3. **Required Structures Identification** (`identify_required_structures.py`) - **NEW** (filters for small molecules)
-4. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **UPDATED** (extracts only required structures)
-5. **PDB Fixing** (`fix_required_pdbs.py`) - **RECOMMENDED**
-6. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
-7. **Batch Docking Execution** (`batch_dock.py`) - **UPDATED** (processes small molecules only)alysis Workflow
-
-This repository contains scripts for running batch consensus doc**Prerequisites**:
-- `uniprot_gene_mapping.csv` (from step 1)
-- `cavity_mapping.csv` (from step 2)
-- `cavityspace_mapping.csv` (from step 3, recom- **extract_alphafold_models.py**: `NUM_THREADS` (adjust for extraction performance)
-- **identify_required_structures.py**: File paths for drug-protein data and ligands
-- **fix_required_pdbs.py**: `NUM_THREADS` (adjust for fixing performance)
-- **convert_pdb_to_pdbqt.py**: `NUM_THREADS` (adjust for your CPU cores)nded)
-- `pdbqt_mapping.csv` (from step 4, optional but recommended)xperiments using AlphaFold structures and cavity data.
+This repository contains scripts for running batch consensus docking experiments using AlphaFold structures and cavity data. The workflow processes **small molecule drugs only**.
 
 ## Workflow Overview
 
-The docking workflow consists of seven main steps:
+The docking workflow consists of the following main steps:
 
 1. **UniProt Mapping Generation** (`prepare_uniprot_mapping.py`)
 2. **Cavity Extraction** (`extract_cavities.py`)
-3. **Required Structures Identification** (`identify_required_structures.py`) - **NEW & RECOMMENDED**
-4. **AlphaFold Model Extraction** (`extract_alphafold_models.py`) - **RECOMMENDED** (now extracts only required structures)
-5. **PDB Fixing** (`fix_required_pdbs.py`) - **RECOMMENDED**
-6. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`) - **OPTIONAL BUT RECOMMENDED**
-7. **Batch Docking Execution** (`batch_dock.py`)
+3. **Required Structures Identification** (`identify_required_structures.py`)
+4. **Negative Sample Generation** (`generate_negative_samples.py`) - Optional for ML training
+5. **AlphaFold Model Extraction** (`extract_alphafold_models.py`)
+6. **PDB Fixing** (`fix_required_pdbs.py`)
+7. **PDB to PDBQT Conversion** (`convert_pdb_to_pdbqt.py`)
+8. **Batch Docking Execution** (`batch_dock.py`)
 
 ## Scripts
 
@@ -59,7 +43,7 @@ python extract_cavities.py
 - `extracted_cavities/` - Directory with extracted PDB files
 - `cavity_extraction.log` - Extraction log
 
-### 3. identify_required_structures.py ⭐ **NEW - OPTIMIZATION**
+### 3. identify_required_structures.py
 Identifies which AlphaFold structures are actually needed based on drug-protein interactions and ligand availability. This allows selective processing of only the structures that will be used for docking, dramatically improving efficiency.
 
 **Features**:
@@ -80,11 +64,48 @@ python identify_required_structures.py
 - `required_structures.csv` - List of required structures for docking
 - `required_structures.log` - Processing log
 
-### 4. extract_alphafold_models.py ⭐ **UPDATED - RECOMMENDED**
+### 4. generate_negative_samples.py (Optional)
+Generates negative samples (non-interacting drug-target pairs) to complement positive samples. This is essential for machine learning model training and evaluation, enabling proper assessment of docking quality.
+
+**Purpose**: Creates balanced datasets with both positive (known interactions) and negative (non-interactions) samples for downstream analysis.
+
+**Strategy**: Implements **Balanced Negative Sampling** based on Najm et al.
+- **Key principle**: Each drug and target appears in equal numbers of positive and negative samples
+- **Prevents spurious learning**: Model won't learn that "Drug X interacts with everything" or "Target Y never interacts"
+- **Greedy algorithm**: Efficiently satisfies both drug and target balance constraints simultaneously
+- **Example**: A drug with 20 positive targets gets 20 negative targets; a drug with 1 positive target gets 1 negative target
+
+**Features**:
+- **Balanced representation**: Maintains equal positive/negative counts per drug and per target
+- **Intelligent validation**: Ensures no known interactions are included as negatives
+- **Reproducible**: Seeded random generation for consistent results
+- **Resource checking**: Validates ligand SDF files and protein structure availability
+- **Comprehensive reporting**: Detailed balance statistics and underbalanced entity warnings
+- **Augments existing data**: Works with `required_structures.csv` from step 3
+
+**Configuration**: Edit file paths in script:
+- `DRUG_TO_PROTEIN_TSV`: Known drug-protein interactions to avoid as negatives
+- `SMALL_MOLECULE_DRUGS_CSV`: Available DrugBank drugs
+- `CAVITY_MAPPING_CSV`: Available protein structures/pockets
+- `PROCESSED_LIGAND_SDF_FOLDER`: Location of ligand SDF files
+
+**Usage**:
+```bash
+python generate_negative_samples.py
+```
+
+**Output**:
+- `required_structures_with_negatives.csv` - Augmented structure list with positive and negative samples
+- `negative_samples_metadata.json` - Statistics and balance metrics
+- `negative_samples.log` - Processing log with balance statistics
+
+**Note**: Downstream scripts (steps 5-8) will automatically use `required_structures_with_negatives.csv` if it exists, otherwise fall back to `required_structures.csv`. This allows seamless integration without modifying existing scripts.
+
+### 5. extract_alphafold_models.py
 Extracts full AlphaFold models for required structures only (if step 3 was run). This extracts structures directly from the local AlphaFold database archive. Now optimized to only extract structures that will actually be used.
 
 **Features**:
-- **Selective extraction**: Only extracts required structures (from `required_structures.csv`)
+- **Selective extraction**: Only extracts required structures (from `required_structures.csv` or `required_structures_with_negatives.csv`)
 - **Fallback capability**: Uses `cavity_mapping.csv` if required structures not available
 - **Offline extraction** from local AlphaFold database archive
 - **Parallel processing** with configurable thread count
@@ -109,31 +130,7 @@ python extract_alphafold_models.py
 - Local AlphaFold database archive
 - `tarfile` and `gzip` Python libraries
 
-Identifies which AlphaFold structures are actually needed based on drug-protein interactions. This optimization step ensures we only process structures that will be used in docking, making the workflow more efficient.
-
-**Features**:
-- **Smart filtering** based on drug-protein interaction data
-- **Ligand availability checking** to ensure corresponding SDF files exist
-- **Priority ranking** by interaction count
-- **Detailed reporting** of required vs available structures
-
-**Configuration**: Edit paths for drug-protein data and ligand folder
-
-**Usage**:
-```bash
-python identify_required_structures.py
-```
-
-**Output**:
-- `required_structures.csv` - List of structures needed for docking
-- `required_structures.log` - Processing log
-
-**Requirements**:
-- Drug-protein interaction TSV file
-- UniProt mapping and cavity mapping files
-- Processed ligand SDF folder
-
-### 5. fix_required_pdbs.py ⭐ **NEW - RECOMMENDED**
+### 6. fix_required_pdbs.py
 
 Fixes PDB files by adding hydrogens and performing other corrections needed for accurate docking. This step only processes the structures identified as required, making it much more efficient than fixing all structures.
 
@@ -158,10 +155,10 @@ python fix_required_pdbs.py
 
 **Requirements**:
 - `pdbfixer` and `openmm` packages
-- Required structures list from step 4
+- Required structures list from step 3 or 4
 
-### 6. convert_pdb_to_pdbqt.py ⭐ **OPTIONAL BUT RECOMMENDED**
-Converts receptor PDB files to PDBQT format with parallel processing. This step is optional but highly recommended as it significantly speeds up docking by pre-converting files. **Uses fixed structures if available from step 5.**
+### 7. convert_pdb_to_pdbqt.py
+Converts receptor PDB files to PDBQT format with parallel processing. This step is optional but highly recommended as it significantly speeds up docking by pre-converting files. Uses fixed structures if available from step 6.
 
 **Features**:
 - **Parallel processing** with configurable thread count
@@ -185,11 +182,13 @@ python convert_pdb_to_pdbqt.py
 **Requirements**:
 - OpenBabel Python bindings (`openbabel-python` or `conda install openbabel`)
 
-### 7. batch_dock.py ⭐ **UPDATED**
-Main docking execution script that uses pre-generated mappings to run consensus docking jobs for **small molecule drugs only**.
+### 8. batch_dock.py
+Main docking execution script that uses pre-generated mappings to run consensus docking jobs for small molecule drugs only.
 
 **Features**:
 - **Small molecule filtering**: Only processes small molecule drugs from DrugBank
+- **Automatic negative sample support**: Uses `required_structures_with_negatives.csv` if available, falls back to `DRUG_TO_PROTEIN_TSV` otherwise
+- **Explicit cavity targeting**: When using negative samples file, docks only specified drug-target-pocket combinations (more efficient)
 - Uses pre-extracted cavity mappings (faster startup)
 - **Automatic PDBQT detection**: Uses pre-converted PDBQT files if available for faster docking
 - **Smart mapping priority**: Uses fixed structures > AlphaFold structures > cavity structures
@@ -197,13 +196,25 @@ Main docking execution script that uses pre-generated mappings to run consensus 
 - Test mode for validation
 - Resume capability (skips completed jobs)
 
+**Docking Modes**:
+1. **With negative samples** (`required_structures_with_negatives.csv` present):
+   - Docks exact drug-target-pocket combinations specified in the file
+   - Includes both positive (known interactions) and negative (non-interactions) samples
+   - Only docks to specified cavities (more efficient, avoids unnecessary work)
+   - Ideal for ML training datasets with balanced positive/negative samples
+
+2. **Without negative samples** (fallback to `DRUG_TO_PROTEIN_TSV`):
+   - Docks all known drug-protein interactions
+   - Docks to all available cavities for each target
+   - Original behavior for standard docking experiments
+
 **Prerequisites**:
 - `uniprot_gene_mapping.csv` (from step 1)
 - `cavity_mapping.csv` (from step 2)
-- `required_structures.csv` (from step 3, recommended for efficiency)
-- `alphafold_mapping.csv` (from step 4, recommended for better results)
-- `fixed_mapping.csv` (from step 5, optional but recommended)
-- `pdbqt_mapping.csv` (from step 6, optional but recommended)
+- `required_structures_with_negatives.csv` (from step 4, preferred) OR `DRUG_TO_PROTEIN_TSV` (fallback)
+- `alphafold_mapping.csv` (from step 5, recommended for better results)
+- `fixed_mapping.csv` (from step 6, optional but recommended)
+- `pdbqt_mapping.csv` (from step 7, optional but recommended)
 
 **Usage**:
 ```bash
@@ -242,7 +253,7 @@ All scripts now handle multiple cavities per protein:
 
 ## Recommended Workflow
 
-### Option 1: Manual Step-by-Step
+### Option 1: Manual Step-by-Step (Positive Samples Only)
 ```bash
 # Step 1: Generate UniProt mappings (if not already done)
 python prepare_uniprot_mapping.py
@@ -250,17 +261,40 @@ python prepare_uniprot_mapping.py
 # Step 2: Extract cavities (can take a while, run once)
 python extract_cavities.py
 
-# Step 3: Extract AlphaFold structures (RECOMMENDED - better than vacant files)
+# Step 3: Identify required structures (filters for needed structures only)
+python identify_required_structures.py
+
+# Step 4: Extract AlphaFold structures (extracts only required structures)
 python extract_alphafold_models.py
 
-# Step 4: Convert PDB to PDBQT (RECOMMENDED - saves significant time later)
+# Step 5: Fix PDB files (adds hydrogens to required structures)
+python fix_required_pdbs.py
+
+# Step 6: Convert PDB to PDBQT (saves significant time during docking)
 python convert_pdb_to_pdbqt.py
 
-# Step 5: Run batch docking (now much faster with pre-converted files)
+# Step 7: Run batch docking (now much faster with pre-converted files)
 python batch_dock.py
 ```
 
-### Option 2: Automated Workflow Runner ⭐ **NEW**
+### Option 1b: Manual Step-by-Step (With Negative Samples for ML)
+```bash
+# Steps 1-3: Same as above
+python prepare_uniprot_mapping.py
+python extract_cavities.py
+python identify_required_structures.py
+
+# Step 4: Generate negative samples (optional, for ML training)
+python generate_negative_samples.py
+
+# Steps 5-8: Continue as normal (will process both positive and negative samples)
+python extract_alphafold_models.py
+python fix_required_pdbs.py
+python convert_pdb_to_pdbqt.py
+python batch_dock.py
+```
+
+### Option 2: Automated Workflow Runner
 ```bash
 # Run the complete workflow automatically
 python run_full_workflow.py
@@ -285,6 +319,7 @@ Before running the scripts, update the configuration paths in each script:
 
 - **extract_cavities.py**: `CAVITY_TARBALL_FOLDER`
 - **identify_required_structures.py**: `DRUG_TO_PROTEIN_TSV`, `SMALL_MOLECULE_DRUGS_CSV`, `PROCESSED_LIGAND_SDF_FOLDER`
+- **generate_negative_samples.py**: `DRUG_TO_PROTEIN_TSV`, `SMALL_MOLECULE_DRUGS_CSV`, `CAVITY_MAPPING_CSV`, `PROCESSED_LIGAND_SDF_FOLDER`
 - **extract_alphafold_models.py**: `NUM_THREADS` (adjust for extraction performance)
 - **fix_required_pdbs.py**: `NUM_THREADS` (adjust for fixing performance)
 - **convert_pdb_to_pdbqt.py**: `NUM_THREADS` (adjust for your CPU)
@@ -296,43 +331,54 @@ Before running the scripts, update the configuration paths in each script:
 your_working_directory/
 ├── prepare_uniprot_mapping.py
 ├── extract_cavities.py
-├── extract_alphafold_models.py         # NEW
-├── identify_required_structures.py     # NEW
-├── fix_required_pdbs.py               # NEW
-├── convert_pdb_to_pdbqt.py             # NEW
+├── identify_required_structures.py
+├── generate_negative_samples.py        # Optional: for negative sample generation
+├── extract_alphafold_models.py
+├── fix_required_pdbs.py
+├── convert_pdb_to_pdbqt.py
 ├── batch_dock.py
-├── run_full_workflow.py                # NEW - Automated workflow runner
+├── run_full_workflow.py                # Automated workflow runner
 ├── uniprot_gene_mapping.csv            # Generated by step 1
 ├── cavity_mapping.csv                  # Generated by step 2
-├── alphafold_mapping.csv               # Generated by step 3 (recommended)
-├── required_structures.csv             # Generated by step 4 (optimization)
-├── fixed_mapping.csv                   # Generated by step 5 (recommended)
-├── pdbqt_mapping.csv                   # Generated by step 6 (optional)
-├── extracted_cavities/               # Generated by step 2
+├── required_structures.csv             # Generated by step 3 (positive samples only)
+├── required_structures_with_negatives.csv  # Generated by step 4 (optional, with negatives)
+├── negative_samples_metadata.json      # Generated by step 4 (optional)
+├── alphafold_mapping.csv               # Generated by step 5
+├── fixed_mapping.csv                   # Generated by step 6
+├── pdbqt_mapping.csv                   # Generated by step 7
+├── extracted_cavities/                 # Generated by step 2
 │   ├── AF-P12345-F1-model_v1/
 │   │   ├── ...vacant_1.pdb
 │   │   ├── ...cavity_1.pdb
 │   │   ├── ...vacant_2.pdb
-│   │   └── ...cavity_2.pdb
+│   │   ├── ...cavity_2.pdb
 │   └── ...
-├── cavityspace_structures/             # Generated by step 3 (recommended)
+├── alphafold_structures/               # Generated by step 5
 │   ├── P12345/
 │   │   ├── AF-P12345-F1-model_v4.pdb
 │   │   └── AF-P12345-F1-predicted_aligned_error_v4.json
 │   └── ...
-├── converted_pdbqt/                    # Generated by step 4 (optional)
+├── fixed_structures/                   # Generated by step 6
+│   ├── P12345/
+│   │   ├── AF-P12345-F1-model_v4_fixed.pdb
+│   │   └── ...
+│   └── ...
+├── converted_pdbqt/                    # Generated by step 7
 │   ├── P12345/
 │   │   ├── AF-P12345-F1-model_v4.pdbqt
 │   │   └── ...
 │   └── ...
-├── consensus_docking_results/          # Generated by step 5
+├── consensus_docking_results/          # Generated by step 8
 │   ├── DB00001_GENE1_P12345_cavity_1/
 │   ├── DB00001_GENE1_P12345_cavity_2/
 │   └── ...
 ├── cavity_extraction.log
-├── alphafold_extraction.log            # Generated by step 4
-├── pdb_to_pdbqt_conversion.log         # NEW
-└── docking_automation.log
+├── required_structures.log             # Generated by step 3
+├── negative_samples.log                # Generated by step 4 (optional)
+├── alphafold_extraction.log            # Generated by step 5
+├── pdb_fixing.log                      # Generated by step 6
+├── pdb_to_pdbqt_conversion.log         # Generated by step 7
+└── docking_automation.log              # Generated by step 8
 ```
 
 ## Performance Benefits
@@ -353,10 +399,15 @@ your_working_directory/
 
 ## Notes
 
-- **Steps 3-4 are optional but highly recommended** for significant time savings and better docking quality
-- **Step 3 (AlphaFold download) is especially important** as it replaces cavity-extracted "vacant" files with complete protein structures
+- Steps 4-7 are optional but highly recommended for significant time savings and better docking quality
+- Step 3 (identify required structures) is especially important as it optimizes the workflow to only process needed structures
+- Step 4 (negative sample generation) is optional but essential for machine learning model training and evaluation
+  - Negative samples allow proper assessment of model performance and prevent overfitting
+  - Can be skipped if only running basic docking experiments
+  - Downstream scripts automatically detect and use negatives if available
+- Step 5 (AlphaFold extraction) replaces cavity-extracted "vacant" files with complete protein structures
 - Run `extract_cavities.py` in test mode first to verify your cavity tarball folder is correct
-- The AlphaFold download and PDBQT conversion steps only need to be run once unless you get new cavity data
+- The structure identification, negative sample generation, AlphaFold extraction, PDB fixing, and PDBQT conversion steps only need to be run once unless you get new cavity data
 - Use TEST_MODE=True in `batch_dock.py` to validate your setup before running full batch
 - All scripts support resumption - they will skip work that's already been completed
 - Ensure OpenBabel and requests are installed before running the respective scripts
