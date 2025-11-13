@@ -36,7 +36,7 @@ pd.options.mode.chained_assignment = None
 # Performance settings
 CHUNK_SIZE = 10000  # For chunked processing
 MAX_WORKERS_SEARCH = None  # Use all cores for search
-MAX_WORKERS_LOAD = 4  # Limit for I/O operations
+MAX_WORKERS_LOAD = 8  # Limit for I/O operations
 PROGRESS_UPDATE_INTERVAL = 0.1  # Progress bar update frequency
 
 def get_system_info():
@@ -325,8 +325,9 @@ def optimized_file_loader(file_info):
         dir_name = os.path.basename(dir_path)
         
         # Parse the directory name format: {drugbank_id}_{gene_name}_{uniprot_id}_cavity_{cavity_number}
+        # Note: gene_name can be "nan" (lowercase) for entries without gene symbols
         import re
-        match = re.match(r'(DB\d+)_([A-Z0-9]+)_([A-Z0-9]+)_cavity_(\d+)', dir_name)
+        match = re.match(r'(DB\d+)_([A-Za-z0-9]+)_([A-Z0-9]+)_cavity_(\d+)', dir_name)
         if match:
             drugbank_id, gene_name, uniprot_id, cavity_num = match.groups()
             df['drugbank_id'] = drugbank_id
@@ -748,7 +749,8 @@ def export_prepared_data_optimized(df, output_dir="./"):
                         if pd.isna(source_dir):
                             return 'Unknown'
                         dir_name = os.path.basename(str(source_dir))
-                        match = re.match(r'(DB\d+)_[A-Z0-9]+_[A-Z0-9]+_cavity_\d+', dir_name)
+                        # Allow lowercase letters in gene_name (e.g., "nan")
+                        match = re.match(r'(DB\d+)_[A-Za-z0-9]+_[A-Z0-9]+_cavity_\d+', dir_name)
                         return match.group(1) if match else 'Unknown'
                     export_df[col] = export_df['source_dir'].apply(extract_drugbank_id)
                 else:
@@ -761,7 +763,8 @@ def export_prepared_data_optimized(df, output_dir="./"):
                         if pd.isna(source_dir):
                             return 'Unknown'
                         dir_name = os.path.basename(str(source_dir))
-                        match = re.match(r'DB\d+_[A-Z0-9]+_([A-Z0-9]+)_cavity_\d+', dir_name)
+                        # Allow lowercase letters in gene_name (e.g., "nan")
+                        match = re.match(r'DB\d+_[A-Za-z0-9]+_([A-Z0-9]+)_cavity_\d+', dir_name)
                         return match.group(1) if match else 'Unknown'
                     export_df[col] = export_df['source_dir'].apply(extract_uniprot_id)
                 else:

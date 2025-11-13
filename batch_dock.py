@@ -115,7 +115,7 @@ LEDOCK_EXHAUSTIVENESS = 12      # Kept for compatibility but ignored by LeDock (
 LEDOCK_TIMEOUT = 600            # Timeout for ledock jobs in seconds (10 minutes)
 # Stage 4: RMSD calculation (if all tools completed but final results missing)
 RMSD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for RMSD calculation
-RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds (50 minutes)
+RMSD_TIMEOUT = 1000              # Timeout for RMSD calculation in seconds
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
