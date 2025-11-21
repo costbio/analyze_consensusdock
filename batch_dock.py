@@ -104,18 +104,18 @@ ADAPTIVE_SCALING_FACTOR = 0.8              # Factor to reduce jobs when resource
 # Stage 1: Smina only (high exhaustiveness = high CPU usage per job, low parallelism)
 SMINA_MAX_PARALLEL_JOBS = 2     # Maximum parallel jobs for smina stage
 SMINA_EXHAUSTIVENESS = 32       # High exhaustiveness for smina (CPU cores used per job)
-SMINA_TIMEOUT = 300           # Timeout for smina jobs in seconds (5 minutes)
+SMINA_TIMEOUT = 600           # Timeout for smina jobs in seconds (10 minutes)
 # Stage 2: Gold (single-threaded, high parallelism possible)
 GOLD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for gold stage
 GOLD_EXHAUSTIVENESS = 12        # Kept for compatibility but ignored by Gold (single-threaded)
-GOLD_TIMEOUT = 600              # Timeout for gold jobs in seconds (10 minutes)
+GOLD_TIMEOUT = 1200              # Timeout for gold jobs in seconds (20 minutes)
 # Stage 3: LeDock (single-threaded, high parallelism possible)
 LEDOCK_MAX_PARALLEL_JOBS = 60   # Maximum parallel jobs for ledock stage
 LEDOCK_EXHAUSTIVENESS = 12      # Kept for compatibility but ignored by LeDock (single-threaded)
-LEDOCK_TIMEOUT = 600            # Timeout for ledock jobs in seconds (10 minutes)
+LEDOCK_TIMEOUT = 1200            # Timeout for ledock jobs in seconds (20 minutes)
 # Stage 4: RMSD calculation (if all tools completed but final results missing)
 RMSD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for RMSD calculation
-RMSD_TIMEOUT = 1000              # Timeout for RMSD calculation in seconds
+RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
 LEDOCK_PATH = "/home/onur/software/ledock_linux_x86"
