@@ -71,7 +71,7 @@ PDBQT_MAPPING_CSV = "pdbqt_mapping.csv" # Input file from convert_pdb_to_pdbqt.p
 REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV = "required_structures_with_negatives.csv"  # Input from generate_negative_samples.py (preferred if exists)
 LOG_FILE = "docking_automation.log"
 # --- TEST MODE: Set to True to run only a limited number of docking jobs for testing ---
-TEST_MODE = True
+TEST_MODE = False
 MAX_TEST_JOBS = 40
 # --- CONFIRMATION PROMPT: Set to True to skip user confirmation when not in TEST_MODE ---
 SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
