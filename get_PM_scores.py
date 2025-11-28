@@ -23,6 +23,32 @@ from multiprocessing import Pool, cpu_count
 import tempfile
 from functools import partial
 from tqdm import tqdm
+import concurrent.futures
+import json
+import logging
+import faulthandler
+import signal
+from biopandas.pdb import PandasPdb
+
+faulthandler.register(signal.SIGUSR1)
+# Module-level logger (configured in main entry)
+logger = logging.getLogger("pocketmatch")
+
+def _setup_logger(log_path: str):
+    """Configure file logger once (idempotent)."""
+    logger.setLevel(logging.INFO)
+    # Avoid adding multiple handlers on repeated calls
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(log_path) for h in logger.handlers):
+        # File handler
+        fh = logging.FileHandler(log_path)
+        fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        
+        # Console handler (stderr) - mirrors log to terminal
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
 
 def collect_cavity_files(cavities_dir):
@@ -35,22 +61,24 @@ def collect_cavity_files(cavities_dir):
     Returns:
         List of paths to cavity PDB files
     """
-    print(f"\n🔍 Collecting cavity PDB files from: {cavities_dir}")
+    logger.info(f"Collecting cavity PDB files from: {cavities_dir}")
     
     # Find all cavity PDB files (not vacant files)
     cavity_files = list(Path(cavities_dir).glob("*/AF-*_cavity_*.pdb"))
     
-    print(f"✅ Found {len(cavity_files):,} cavity PDB files")
+    logger.info(f"Found {len(cavity_files):,} cavity PDB files")
     
     return cavity_files
 
 
 def create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, workspace_id):
     """
-    Create an isolated PocketMatch workspace for parallel processing.
+    Create an isolated PocketMatch workspace by copying only essential files.
+    Since workspaces are created sequentially, we can safely copy files without
+    hitting "too many open files" errors.
     
     Args:
-        pm_base_dir: Base PocketMatch directory to copy from
+        pm_base_dir: Base PocketMatch installation directory
         work_dir: Working directory for this process
         workspace_id: Unique identifier for this workspace
         
@@ -59,13 +87,159 @@ def create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, workspace_id):
     """
     isolated_pm_dir = os.path.join(work_dir, f"pm_workspace_{workspace_id}")
     
-    # Copy entire PocketMatch directory to isolated workspace
-    shutil.copytree(pm_base_dir, isolated_pm_dir, dirs_exist_ok=True)
+    # Create workspace directory
+    os.makedirs(isolated_pm_dir, exist_ok=True)
+    
+    # Copy executable file (Step3-PM_typeB is needed for comparisons)
+    step3_typeB = os.path.join(pm_base_dir, "Step3-PM_typeB")
+    if os.path.exists(step3_typeB):
+        dest_step3 = os.path.join(isolated_pm_dir, "Step3-PM_typeB")
+        if not os.path.exists(dest_step3):
+            shutil.copy2(step3_typeB, dest_step3)
+    
+    # Create cabbage-file_maker directory structure
+    cabbage_dir = os.path.join(isolated_pm_dir, "cabbage-file_maker")
+    os.makedirs(cabbage_dir, exist_ok=True)
+    
+    # Copy essential cabbage-file_maker executables and scripts
+    base_cabbage_dir = os.path.join(pm_base_dir, "cabbage-file_maker")
+    for item in ["Step0-cabbage.sh", "Step0-cabbage_core", "Step0-END-FILE"]:
+        src = os.path.join(base_cabbage_dir, item)
+        if os.path.exists(src):
+            dest = os.path.join(cabbage_dir, item)
+            if not os.path.exists(dest):
+                shutil.copy2(src, dest)
+    
+    # Create empty Sample_pockets directory (will be populated later)
+    sample_pockets_dir = os.path.join(cabbage_dir, "Sample_pockets")
+    os.makedirs(sample_pockets_dir, exist_ok=True)
+    
+    # Verify the structure was created successfully
+    if not os.path.isdir(cabbage_dir):
+        raise RuntimeError(f"Failed to create cabbage-file_maker directory: {cabbage_dir}")
+    if not os.path.isdir(sample_pockets_dir):
+        raise RuntimeError(f"Failed to create Sample_pockets directory: {sample_pockets_dir}")
     
     return isolated_pm_dir
 
 
-def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", af_base_dir=None, show_progress=False):
+def extract_complete_residues_from_cavity(args):
+    """
+    Extract complete residues from AlphaFold structure for a single cavity file.
+    Worker function for parallel processing.
+    
+    Uses BioPandas to properly parse PDB files and ensure complete residue extraction.
+    
+    Args:
+        args: Tuple of (idx, pocket_file, af_base_dir, dest_file)
+        
+    Returns:
+        Tuple of (simple_name, original_name, success_status)
+    """
+    idx, pocket_file, af_base_dir, dest_file = args
+    
+    simple_name = f"p{idx+1}.pdb"
+    original_name = os.path.basename(pocket_file)
+    
+    try:
+        # Parse cavity file using BioPandas to get residue information
+        cavity_ppdb = PandasPdb().read_pdb(str(pocket_file))
+        cavity_atoms = cavity_ppdb.df['ATOM']
+        
+        if len(cavity_atoms) == 0:
+            return (simple_name, original_name, False)
+        
+        # Get unique residues from cavity file (chain + residue number)
+        cavity_residues = set(
+            zip(cavity_atoms['chain_id'], cavity_atoms['residue_number'])
+        )
+        
+        # Parse filename to extract protein ID and fragment
+        # Format: AF-PROTEINID-FX-model_vY_cavity_N.pdb
+        pocket_basename = os.path.basename(pocket_file)
+        if not (pocket_basename.startswith('AF-') and '_cavity_' in pocket_basename):
+            # Not an AlphaFold cavity file - skip it
+            return (simple_name, original_name, False)
+        
+        parts = pocket_basename.split('-')
+        if len(parts) < 4:
+            return (simple_name, original_name, False)
+        
+        protein_id = parts[1]  # Extract PROTEINID
+        fragment_id = parts[2]  # Extract FX (F1, F2, F3, etc.)
+        
+        # Find AlphaFold PDB file for the specific fragment
+        af_dir = os.path.join(af_base_dir, protein_id, fragment_id)
+        af_pdb_pattern = f"AF-{protein_id}-{fragment_id}-model_v*.pdb"
+        af_pdb_files = list(Path(af_dir).glob(af_pdb_pattern))
+        
+        if not af_pdb_files:
+            # AlphaFold structure not found - skip this cavity
+            return (simple_name, original_name, False)
+        
+        af_pdb_path = af_pdb_files[0]
+        
+        # Load AlphaFold structure using BioPandas
+        af_ppdb = PandasPdb().read_pdb(str(af_pdb_path))
+        af_atoms = af_ppdb.df['ATOM']
+        
+        if len(af_atoms) == 0:
+            logger.debug(f"No ATOM records in AlphaFold structure for {original_name}")
+            return (simple_name, original_name, False)
+        
+        # CRITICAL VALIDATION: Check that ALL cavity residues have CA atoms in AlphaFold structure
+        # PocketMatch Step0-cabbage_core allocates memory based on CA count
+        # Missing CA atoms cause heap corruption and malloc crashes
+        
+        # Get residues with CA atoms in AlphaFold structure
+        ca_atoms = af_atoms[af_atoms['atom_name'] == 'CA']
+        af_residues_with_ca = set(
+            zip(ca_atoms['chain_id'], ca_atoms['residue_number'])
+        )
+        
+        # Find which cavity residues have CA atoms in AlphaFold
+        valid_residues = cavity_residues & af_residues_with_ca
+        
+        if len(valid_residues) == 0:
+            # No valid residues with CA atoms - this shouldn't happen with AlphaFold
+            # but could happen if cavity file is corrupted
+            return (simple_name, original_name, False)
+        
+        if len(valid_residues) < len(cavity_residues):
+            # Some cavity residues don't have CA atoms in AlphaFold structure
+            # This indicates data corruption - skip this file
+            missing = cavity_residues - valid_residues
+            logger.warning(f"{original_name} has residues without CA atoms: {missing}")
+            return (simple_name, original_name, False)
+        
+        # Extract all atoms for valid residues from AlphaFold structure
+        mask = af_atoms.apply(
+            lambda row: (row['chain_id'], row['residue_number']) in valid_residues,
+            axis=1
+        )
+        extracted_atoms = af_atoms[mask].copy()
+        
+        if len(extracted_atoms) == 0:
+            return (simple_name, original_name, False)
+        
+        # Write extracted atoms to destination file
+        # Create a new PandasPdb object and write properly formatted PDB
+        output_ppdb = PandasPdb()
+        output_ppdb.df['ATOM'] = extracted_atoms
+        
+        # Write to file with proper PDB formatting (80 character lines)
+        output_ppdb.to_pdb(path=dest_file, records=['ATOM'], gz=False)
+        
+        return (simple_name, original_name, True)
+        
+    except Exception as e:
+        logger.warning(f"Failed to process {original_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return (simple_name, original_name, False)
+
+
+def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", af_base_dir=None, show_progress=False, n_threads=None):
     """
     Generate a cabbage file for a set of pocket files.
     
@@ -75,11 +249,17 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
         output_name: Name for the cabbage output file
         af_base_dir: Base directory containing AlphaFold structures (required for extracting complete residues)
         show_progress: Whether to show progress bar
+        n_threads: Number of threads for parallel residue extraction (default: CPU count)
         
     Returns:
         Path to generated cabbage file, dict mapping simplified names to original names
     """
-    sample_pockets_dir = os.path.join(pm_dir, "cabbage-file_maker", "Sample_pockets")
+    # Verify workspace structure exists
+    cabbage_dir = os.path.join(pm_dir, "cabbage-file_maker")
+    if not os.path.exists(cabbage_dir):
+        raise RuntimeError(f"cabbage-file_maker directory does not exist: {cabbage_dir}. Workspace may not be properly initialized.")
+    
+    sample_pockets_dir = os.path.join(cabbage_dir, "Sample_pockets")
     
     # Clean and prepare Sample_pockets directory
     if os.path.exists(sample_pockets_dir):
@@ -88,123 +268,85 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     else:
         os.makedirs(sample_pockets_dir)
     
-    # Copy and clean pocket files to Sample_pockets with simplified names
-    # Extract COMPLETE RESIDUES from AlphaFold structures (not just cavity atoms)
+    # Extract COMPLETE RESIDUES from AlphaFold structures in parallel
     # Use simple numeric names to avoid issues with long names or special characters
     name_mapping = {}
     
-    iterator = enumerate(pocket_files)
+    # Prepare arguments for parallel processing
+    if n_threads is None:
+        n_threads = cpu_count()
+    
+    # Use the provided n_threads value directly
+    # When called from parallel block processing, this will be 1 (sequential)
+    max_workers = n_threads
+    
+    args_list = [
+        (idx, pocket_file, af_base_dir, os.path.join(sample_pockets_dir, f"p{idx+1}.pdb"))
+        for idx, pocket_file in enumerate(pocket_files)
+    ]
+    
+    # Process residue extraction in parallel with timeout
+    # Use ProcessPoolExecutor for true parallelism (bypasses Python GIL)
+    results = []
+    logger.debug(f"Extracting complete residues from {len(pocket_files)} cavity files using {max_workers} workers...")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks and track futures
+        future_to_idx = {executor.submit(extract_complete_residues_from_cavity, args): i for i, args in enumerate(args_list)}
+        
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(future_to_idx):
+            try:
+                result = future.result(timeout=30)  # 30s per file
+                results.append(result)
+                idx = future_to_idx[future]
+                logger.debug(f"Extracted residues from file {idx+1}/{len(pocket_files)}")
+            except concurrent.futures.TimeoutError:
+                idx = future_to_idx[future]
+                logger.error(f"Timeout processing file index {idx}")
+                results.append((f"p{idx+1}.pdb", "TIMEOUT", False))
+            except Exception as e:
+                idx = future_to_idx[future]
+                logger.error(f"Error processing file index {idx}: {e}")
+                results.append((f"p{idx+1}.pdb", "ERROR", False))
+    
+    # Build name mapping from results
+    for simple_name, original_name, _ in results:
+        name_mapping[simple_name] = original_name
+    
+    # Generate cabbage file using Step0-cabbage.sh
+    cabbage_dir = os.path.join(pm_dir, "cabbage-file_maker")
+    
+    # Verify outfile.cabbage does not exist (should have been cleaned in create_isolated_pocketmatch_workspace)
+    outfile_path = os.path.join(cabbage_dir, "outfile.cabbage")
+    if os.path.exists(outfile_path):
+        raise RuntimeError(f"outfile.cabbage still exists at {outfile_path} - cleanup failed")
+    
+    # Run Step0-cabbage.sh with Sample_pockets directory as argument
+    sample_pockets_dir = os.path.join(cabbage_dir, "Sample_pockets")
+    
     if show_progress:
-        iterator = tqdm(iterator, total=len(pocket_files), desc="   Extracting complete residues", leave=False)
+        logger.info("Generating cabbage file...")
     
-    for idx, pocket_file in iterator:
-        # Create simple name: p1.pdb, p2.pdb, etc.
-        simple_name = f"p{idx+1}.pdb"
-        dest_file = os.path.join(sample_pockets_dir, simple_name)
-        name_mapping[simple_name] = os.path.basename(pocket_file)
-        
-        # Parse cavity file to get residues
-        residues_to_keep = set()
-        with open(pocket_file, 'r') as f:
-            for line in f:
-                if line.startswith('ATOM'):
-                    chain = line[21:22]
-                    res_num = line[22:26].strip()
-                    residues_to_keep.add((chain, res_num))
-        
-        # Find corresponding AlphaFold structure
-        # Extract protein ID from filename: AF-PROTEINID-F1-model_v1_cavity_N.pdb
-        pocket_basename = os.path.basename(pocket_file)
-        if pocket_basename.startswith('AF-') and '_cavity_' in pocket_basename:
-            protein_id = pocket_basename.split('-')[1]  # Extract PROTEINID
-            
-            # Find AlphaFold PDB file
-            af_dir = os.path.join(af_base_dir, protein_id, "F1")
-            af_pdb_files = list(Path(af_dir).glob(f"AF-{protein_id}-F1-model_v*.pdb"))
-            
-            if af_pdb_files:
-                af_pdb = af_pdb_files[0]
-                # Extract complete residues from AlphaFold structure
-                with open(af_pdb, 'r') as infile, open(dest_file, 'w') as outfile:
-                    for line in infile:
-                        if line.startswith('ATOM'):
-                            chain = line[21:22]
-                            res_num = line[22:26].strip()
-                            if (chain, res_num) in residues_to_keep:
-                                # Keep original line, ensure 80 chars
-                                line_stripped = line.rstrip('\n\r')
-                                line_80 = line_stripped.ljust(80)[:80]
-                                outfile.write(line_80 + '\n')
-            else:
-                # Fallback: use cavity file as-is if AlphaFold structure not found
-                with open(pocket_file, 'r') as infile, open(dest_file, 'w') as outfile:
-                    for line in infile:
-                        if line.startswith('ATOM'):
-                            line_stripped = line.rstrip('\n\r')
-                            line_80 = line_stripped.ljust(80)[:80]
-                            outfile.write(line_80 + '\n')
-        else:
-            # Not an AlphaFold cavity file, use as-is
-            with open(pocket_file, 'r') as infile, open(dest_file, 'w') as outfile:
-                for line in infile:
-                    if line.startswith('ATOM'):
-                        line_stripped = line.rstrip('\n\r')
-                        line_80 = line_stripped.ljust(80)[:80]
-                        outfile.write(line_80 + '\n')
+    logger.debug(f"Running Step0-cabbage.sh with Sample_pockets: {sample_pockets_dir}")
+    cmd = ["./Step0-cabbage.sh", sample_pockets_dir]
+    # Use cwd parameter instead of os.chdir() to avoid threading issues
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cabbage_dir)
     
-    # Generate cabbage file
-    # Process each PDB file individually to avoid memory corruption in Step0-cabbage_core
-    original_dir = os.getcwd()
-    try:
-        cabbage_dir = os.path.join(pm_dir, "cabbage-file_maker")
-        os.chdir(cabbage_dir)
-        
-        # Remove old outfile if exists
-        outfile_path = os.path.join(cabbage_dir, "outfile.cabbage")
-        if os.path.exists(outfile_path):
-            os.remove(outfile_path)
-        
-        # Process each PDB file individually and append to outfile.cabbage
-        sample_pockets_dir = os.path.join(cabbage_dir, "Sample_pockets")
-        pdb_files = sorted(Path(sample_pockets_dir).glob("*.pdb"))
-        
-        iterator = pdb_files
-        if show_progress:
-            iterator = tqdm(pdb_files, desc="   Generating cabbage file", leave=False)
-        
-        for pdb_file in iterator:
-            # Run Step0-cabbage_core for each file and append
-            cmd = ["./Step0-cabbage_core", str(pdb_file)]
-            result = subprocess.run(cmd, capture_output=True)
-            
-            if result.returncode != 0:
-                raise RuntimeError(f"Cabbage generation failed for {pdb_file.name}: {result.stderr}")
-            
-            # Append the output to outfile.cabbage
-            with open(outfile_path, 'ab') as outfile:
-                outfile.write(result.stdout)
-        
-        # Add END-FILE marker
-        cmd = ["./Step0-END-FILE"]
-        result = subprocess.run(cmd, capture_output=True)
-        with open(outfile_path, 'ab') as outfile:
-            outfile.write(result.stdout)
-        
-        if not os.path.exists(outfile_path):
-            raise FileNotFoundError(f"Cabbage file not created: {outfile_path}")
-        
-        # Rename if needed
-        if output_name != "outfile.cabbage":
-            new_path = os.path.join(cabbage_dir, output_name)
-            shutil.move(outfile_path, new_path)
-            cabbage_file = new_path
-        else:
-            cabbage_file = outfile_path
-        
-        return cabbage_file, name_mapping
-        
-    finally:
-        os.chdir(original_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"Cabbage generation failed: {result.stderr}")
+    
+    if not os.path.exists(outfile_path):
+        raise FileNotFoundError(f"Cabbage file not created: {outfile_path}")
+    
+    # Rename if needed
+    if output_name != "outfile.cabbage":
+        new_path = os.path.join(cabbage_dir, output_name)
+        shutil.move(outfile_path, new_path)
+        cabbage_file = new_path
+    else:
+        cabbage_file = outfile_path
+    
+    return cabbage_file, name_mapping
 
 
 def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full):
@@ -219,34 +361,28 @@ def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full):
     Returns:
         Path to output file
     """
-    original_dir = os.getcwd()
-    try:
-        os.chdir(pm_dir)
-        
-        # Copy cabbage files to PM directory if not already there
-        chunk_local = os.path.join(pm_dir, os.path.basename(cabbage_chunk))
-        full_local = os.path.join(pm_dir, os.path.basename(cabbage_full))
-        
-        if cabbage_chunk != chunk_local:
-            shutil.copy2(cabbage_chunk, chunk_local)
-        if cabbage_full != full_local:
-            shutil.copy2(cabbage_full, full_local)
-        
-        # Run PocketMatch typeB
-        cmd = ["./Step3-PM_typeB", os.path.basename(chunk_local), os.path.basename(full_local)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"PocketMatch typeB failed with code {result.returncode}. stderr: {result.stderr}, stdout: {result.stdout}")
-        
-        output_file = os.path.join(pm_dir, "PocketMatch_score.txt")
-        if not os.path.exists(output_file):
-            raise FileNotFoundError(f"PocketMatch output not created: {output_file}")
-        
-        return output_file
-        
-    finally:
-        os.chdir(original_dir)
+    # Copy cabbage files to PM directory if not already there
+    chunk_local = os.path.join(pm_dir, os.path.basename(cabbage_chunk))
+    full_local = os.path.join(pm_dir, os.path.basename(cabbage_full))
+    
+    if cabbage_chunk != chunk_local:
+        shutil.copy2(cabbage_chunk, chunk_local)
+    if cabbage_full != full_local:
+        shutil.copy2(cabbage_full, full_local)
+    
+    # Run PocketMatch typeB
+    cmd = ["./Step3-PM_typeB", os.path.basename(chunk_local), os.path.basename(full_local)]
+    # Use cwd parameter instead of os.chdir() to avoid threading issues
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=pm_dir)
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"PocketMatch typeB failed with code {result.returncode}. stderr: {result.stderr}, stdout: {result.stdout}")
+    
+    output_file = os.path.join(pm_dir, "PocketMatch_score.txt")
+    if not os.path.exists(output_file):
+        raise FileNotFoundError(f"PocketMatch output not created: {output_file}")
+    
+    return output_file
 
 
 def process_chunk(chunk_id, chunk_files, all_files, pm_base_dir, work_dir, af_base_dir=None, debug=False):
@@ -266,7 +402,7 @@ def process_chunk(chunk_id, chunk_files, all_files, pm_base_dir, work_dir, af_ba
         DataFrame with similarity results for this chunk
     """
     try:
-        print(f"   Worker {chunk_id}: Processing {len(chunk_files)} pockets...")
+        logger.info(f"Worker {chunk_id}: Processing {len(chunk_files)} pockets...")
         
         # Create isolated workspace
         isolated_pm = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, chunk_id)
@@ -299,9 +435,9 @@ def process_chunk(chunk_id, chunk_files, all_files, pm_base_dir, work_dir, af_ba
         output_file = run_pocketmatch_typeB(isolated_pm, cabbage_chunk, cabbage_full)
         
         # Parse results with name mapping
-        df_chunk = parse_pocketmatch_output(output_file, full_mapping)
+        df_chunk = parse_pocketmatch_output(output_file, name_mapping2=full_mapping)
         
-        print(f"   Worker {chunk_id}: ✅ Completed - {len(df_chunk)} comparisons")
+        logger.info(f"Worker {chunk_id}: Completed - {len(df_chunk)} comparisons")
         
         # Cleanup isolated workspace
         if not debug:
@@ -310,13 +446,98 @@ def process_chunk(chunk_id, chunk_files, all_files, pm_base_dir, work_dir, af_ba
         return df_chunk
         
     except Exception as e:
-        print(f"   Worker {chunk_id}: ❌ Error - {e}")
+        logger.error(f"Worker {chunk_id}: Error - {e}")
         import traceback
         traceback.print_exc()
         return pd.DataFrame()
 
 
-def parse_pocketmatch_output(output_file, name_mapping=None):
+def build_cabbage_block(block_id, pocket_files, pm_base_dir, work_dir, af_base_dir, max_internal_threads=1, show_progress=False, verbose=False, isolated_pm=None):
+    """
+    Build a cabbage file for a block (<=100 pockets) in an isolated workspace.
+    Returns (cabbage_path, name_mapping, tmp_workspace_path).
+    The workspace is cleaned by the caller after consuming outputs if needed.
+    """
+    logger.info(f"Block {block_id}: Building cabbage with {len(pocket_files)} pockets")
+    if verbose:
+        logger.debug(f"Block {block_id}: Starting build with {len(pocket_files)} pockets")
+    # Use pre-created workspace if provided, otherwise create new one
+    if isolated_pm is None:
+        isolated_pm = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"blk_{block_id}")
+    try:
+        cabbage_path, name_mapping = generate_cabbage_file(
+            isolated_pm,
+            pocket_files,
+            output_name=f"block_{block_id}.cabbage",
+            af_base_dir=af_base_dir,
+            show_progress=show_progress,
+            n_threads=max_internal_threads,
+        )
+        # Move outputs to a shared blocks dir for later comparisons
+        blocks_dir = os.path.join(work_dir, "cabbage_blocks")
+        os.makedirs(blocks_dir, exist_ok=True)
+        final_cabbage = os.path.join(blocks_dir, f"block_{block_id}.cabbage")
+        shutil.copy2(cabbage_path, final_cabbage)
+        # Persist mapping
+        mapping_path = os.path.join(blocks_dir, f"block_{block_id}.mapping.json")
+        with open(mapping_path, 'w') as f:
+            json.dump(name_mapping, f)
+        logger.info(f"Block {block_id}: Finished -> {final_cabbage}")
+        if verbose:
+            logger.debug(f"Block {block_id}: Completed successfully")
+        return final_cabbage, name_mapping, isolated_pm
+    except Exception as e:
+        # Don't delete workspace here - will be cleaned up by caller after all blocks finish
+        # Deleting during parallel execution causes race conditions where other blocks
+        # try to access files that have been deleted
+        logger.error(f"Block {block_id}: Error during build - {e}")
+        raise
+
+
+def run_block_comparison(pair_id, cabbage_a, cabbage_b, mapping_a, mapping_b, pm_base_dir, work_dir, debug=False, verbose=False, isolated_pm=None):
+    """
+    Run Step3-PM_typeB for two cabbage blocks and parse with separate mappings.
+    Returns DataFrame of results for this pair.
+    """
+    try:
+        logger.info(f"Pair {pair_id}: Starting comparison {os.path.basename(cabbage_a)} vs {os.path.basename(cabbage_b)}")
+        if verbose:
+            logger.debug(f"Pair {pair_id}: Starting comparison")
+        # Use pre-created workspace if provided, otherwise create new one
+        if isolated_pm is None:
+            isolated_pm = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"cmp_{pair_id}")
+        # Copy cabbage files for this comparison into workspace
+        local_a = os.path.join(isolated_pm, os.path.basename(cabbage_a))
+        local_b = os.path.join(isolated_pm, os.path.basename(cabbage_b))
+        shutil.copy2(cabbage_a, local_a)
+        shutil.copy2(cabbage_b, local_b)
+
+        # Run comparison
+        output_file = run_pocketmatch_typeB(isolated_pm, local_a, local_b)
+
+        # Parse using separate mappings: first set uses mapping_a, second uses mapping_b
+        df = parse_pocketmatch_output(output_file, name_mapping1=mapping_a, name_mapping2=mapping_b)
+        
+        # Report completion to log
+        completion_msg = f"Pair {pair_id}: Completed with {len(df)} comparisons"
+        logger.info(completion_msg)
+
+        return df
+    except Exception as e:
+        logger.error(f"Pair {pair_id}: Error - {e}")
+        import traceback
+        import sys
+        # Log full traceback to file
+        tb_str = ''.join(traceback.format_exception(*sys.exc_info()))
+        logger.error(f"Pair {pair_id}: Traceback:\n{tb_str}")
+        return pd.DataFrame()
+    finally:
+        # Always clean up workspace unless debug mode
+        if isolated_pm and not debug:
+            shutil.rmtree(isolated_pm, ignore_errors=True)
+
+
+def parse_pocketmatch_output(output_file, name_mapping=None, name_mapping1=None, name_mapping2=None):
     """
     Parse PocketMatch output file into a DataFrame.
     
@@ -362,30 +583,33 @@ def parse_pocketmatch_output(output_file, name_mapping=None):
     df['Pocket2'] = df['Pocket2'].str.rstrip('_')
     
     # Map simplified names back to original names if mapping provided
-    if name_mapping:
-        # Handle both "p1" and "p1.pdb" formats from PocketMatch output
+    # Backward-compat: if name_mapping is provided, use it for both sides
+    if name_mapping and not (name_mapping1 or name_mapping2):
+        name_mapping1 = name_mapping
+        name_mapping2 = name_mapping
+
+    def make_mapper(mapping):
+        if not mapping:
+            return lambda x: x
         def map_name(x):
-            # Try exact match first
-            if x in name_mapping:
-                return name_mapping[x]
-            # Try adding .pdb extension
-            if x + '.pdb' in name_mapping:
-                return name_mapping[x + '.pdb']
-            # Try removing .pdb extension
+            if x in mapping:
+                return mapping[x]
+            if (x + '.pdb') in mapping:
+                return mapping[x + '.pdb']
             if x.endswith('.pdb'):
                 base = x[:-4]
-                if base in name_mapping:
-                    return name_mapping[base]
-            # Return original if no mapping found
+                if base in mapping:
+                    return mapping[base]
             return x
-        
-        df['Pocket1'] = df['Pocket1'].map(map_name)
-        df['Pocket2'] = df['Pocket2'].map(map_name)
+        return map_name
+
+    df['Pocket1'] = df['Pocket1'].map(make_mapper(name_mapping1))
+    df['Pocket2'] = df['Pocket2'].map(make_mapper(name_mapping2))
     
     return df
 
 
-def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False):
+def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False, verbose=False, test_mode=False):
     """
     Main function to compute PocketMatch similarities with parallelization.
     
@@ -396,13 +620,15 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         af_base_dir: Base directory for AlphaFold structures (optional, for complete residue extraction)
         n_threads: Number of parallel threads (default: CPU count)
         debug: Whether to keep temporary files
+        verbose: Whether to print detailed progress for each block/comparison
+        test_mode: Whether to run in test mode (only first 3 blocks)
         
     Returns:
         DataFrame with pocket similarity scores
     """
-    print("="*80)
-    print("🔬 POCKETMATCH SIMILARITY ANALYSIS (PARALLEL)")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("POCKETMATCH SIMILARITY ANALYSIS (PARALLEL)")
+    logger.info("="*80)
     
     # Validate paths
     if not os.path.exists(cavities_dir):
@@ -411,15 +637,23 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     if not os.path.exists(pm_base_dir):
         raise FileNotFoundError(f"PocketMatch directory not found: {pm_base_dir}")
     
-    # Create output directory
+    # Create output directory FIRST
     os.makedirs(output_dir, exist_ok=True)
     
-    # Determine number of threads
-    if n_threads is None:
-        n_threads = cpu_count()
+    # Setup file logger after output directory exists
+    log_path = os.path.join(output_dir, 'pocketmatch_progress.log')
+    _setup_logger(log_path)
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+    logger.info("Starting PocketMatch analysis")
+    logger.info(f"Logging to: {log_path}")
     
-    print(f"\n⚙️  Configuration:")
-    print(f"   Parallel threads: {n_threads}")
+    # Determine number of threads (use conservative 20 instead of all CPUs to avoid resource exhaustion)
+    if n_threads is None:
+        n_threads = min(20, cpu_count())
+    
+    logger.info(f"Configuration:")
+    logger.info(f"Parallel threads: {n_threads}")
     
     # Collect cavity files
     cavity_files = collect_cavity_files(cavities_dir)
@@ -427,64 +661,111 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     if len(cavity_files) == 0:
         raise ValueError("No cavity PDB files found!")
     
-    # Divide files into chunks
-    chunk_size = max(1, len(cavity_files) // n_threads)
-    chunks = [cavity_files[i:i + chunk_size] for i in range(0, len(cavity_files), chunk_size)]
+    # Divide files into fixed-size blocks for cabbage generation (max 100 per block)
+    block_size = 100
+    blocks = [cavity_files[i:i + block_size] for i in range(0, len(cavity_files), block_size)]
     
-    print(f"\n📦 Dividing into {len(chunks)} chunks:")
-    print(f"   Chunk size: ~{chunk_size} pockets")
-    print(f"   Total comparisons: ~{len(cavity_files) * len(cavity_files):,}")
+    # Test mode: limit to first 3 blocks for quick testing
+    if test_mode:
+        blocks = blocks[:3]
+        logger.warning("TEST MODE: Processing only first 3 blocks (up to 300 pockets)")
+    
+    logger.info(f"Preparing {len(blocks)} cabbage blocks (size <= {block_size})")
     
     # Create temporary working directory
     work_dir = os.path.join(output_dir, "temp_workspaces")
     os.makedirs(work_dir, exist_ok=True)
     
     try:
-        # Generate full set cabbage file once (shared by all workers)
-        print(f"\n🔧 Preparing shared full-set cabbage file...")
-        temp_pm = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, "temp")
-        cabbage_full, name_mapping = generate_cabbage_file(temp_pm, cavity_files, "full_set.cabbage", af_base_dir, show_progress=True)
-        full_cabbage_path = os.path.join(work_dir, "full_set.cabbage")
-        mapping_path = os.path.join(work_dir, "name_mapping.json")
-        shutil.copy2(cabbage_full, full_cabbage_path)
-        # Save name mapping
-        import json
-        with open(mapping_path, 'w') as f:
-            json.dump(name_mapping, f)
-        shutil.rmtree(temp_pm, ignore_errors=True)
-        print(f"   ✅ Shared cabbage file ready")
+        # PRE-CREATE all workspaces sequentially to avoid "too many open files" errors
+        logger.info(f"Pre-creating {len(blocks)} workspaces sequentially...")
+        block_workspaces = {}
+        for i in tqdm(range(len(blocks)), desc="   Creating workspaces"):
+            ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"blk_{i}")
+            block_workspaces[i] = ws
         
-        # Process chunks in parallel
-        print(f"\n🚀 Processing chunks in parallel...")
+        # Generate all cabbage blocks in parallel using pre-created workspaces
+        logger.info("Generating cabbage blocks in parallel...")
+        built_blocks = []  # list of (cabbage_path, mapping, tmp_workspace)
         
-        process_func = partial(
-            process_chunk,
-            all_files=cavity_files,
-            pm_base_dir=pm_base_dir,
-            work_dir=work_dir,
-            af_base_dir=af_base_dir,
-            debug=debug
-        )
+        # Each block processes files with 1 worker internally (sequential per block)
+        # But we run n_threads blocks in parallel
+        logger.info(f"Using {n_threads} parallel blocks (each processes files with 1 worker)")
         
-        with Pool(processes=n_threads) as pool:
-            chunk_args = [(i, chunk) for i, chunk in enumerate(chunks)]
-            results = pool.starmap(process_func, chunk_args)
-        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futures = {
+                ex.submit(build_cabbage_block, i, blk, pm_base_dir, work_dir, af_base_dir, 1, False, verbose, block_workspaces[i]): i
+                for i, blk in enumerate(blocks)
+            }
+            completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
+            for fut in completed:
+                try:
+                    result = fut.result(timeout=1200)  # 20min per block
+                    built_blocks.append(result)
+                except concurrent.futures.TimeoutError:
+                    block_id = futures[fut]
+                    logger.error(f"Block {block_id}: Timeout after 20 minutes")
+                except Exception as e:
+                    block_id = futures[fut]
+                    logger.error(f"Block {block_id}: Error - {e}")
+        logger.info(f"Built {len(built_blocks)} cabbage blocks successfully")
+
+        # Clean up temp workspaces used for building (keep only block files)
+        for _, _, ws in built_blocks:
+            shutil.rmtree(ws, ignore_errors=True)
+
+        # Prepare all pairwise comparisons between blocks (including self)
+        total_pairs = (len(built_blocks) * (len(built_blocks) + 1)) // 2
+        logger.info(f"Submitting {total_pairs} block comparisons (upper triangle)...")
+        pair_jobs = []
+        for i, (cab_i, map_i, _) in enumerate(built_blocks):
+            for j in range(i, len(built_blocks)):
+                cab_j, map_j, _ = built_blocks[j]
+                pair_jobs.append((f"{i}_{j}", cab_i, cab_j, map_i, map_j))
+
+        # PRE-CREATE comparison workspaces sequentially
+        logger.info(f"Pre-creating {len(pair_jobs)} comparison workspaces sequentially...")
+        cmp_workspaces = {}
+        for pid, _, _, _, _ in tqdm(pair_jobs, desc="   Creating cmp workspaces"):
+            ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"cmp_{pid}")
+            cmp_workspaces[pid] = ws
+
+        # Run comparisons with bounded concurrency and timeouts
+        all_pair_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futs = {
+                ex.submit(run_block_comparison, pid, cab_i, cab_j, map_i, map_j, pm_base_dir, work_dir, debug, verbose, cmp_workspaces[pid]): pid
+                for (pid, cab_i, cab_j, map_i, map_j) in pair_jobs
+            }
+            completed = tqdm(concurrent.futures.as_completed(futs, timeout=14400), total=len(futs), desc="   Comparisons")
+            for fut in completed:
+                try:
+                    result = fut.result(timeout=300)  # 5min per comparison
+                    all_pair_results.append(result)
+                except concurrent.futures.TimeoutError:
+                    pair_id = futs[fut]
+                    logger.error(f"Pair {pair_id}: Timeout after 5 minutes")
+                    all_pair_results.append(pd.DataFrame())
+                except Exception as e:
+                    pair_id = futs[fut]
+                    logger.error(f"Pair {pair_id}: Error - {e}")
+                    all_pair_results.append(pd.DataFrame())
+        logger.info(f"Completed {len(all_pair_results)} block comparisons")
+
         # Combine results
-        print(f"\n📊 Combining results from {len(results)} chunks...")
-        valid_results = [df for df in results if len(df) > 0]
-        
+        logger.info(f"Combining results from {len(all_pair_results)} block comparisons...")
+        valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
         if not valid_results:
-            raise ValueError("No valid results from any worker. Check error messages above for details.")
-        
+            raise ValueError("No valid results from any comparison. Check error messages above for details.")
         df_sims = pd.concat(valid_results, ignore_index=True)
+        logger.info(f"Aggregated results: {len(df_sims)} rows before dedup")
         
         # Remove duplicates (typeB may create some)
         initial_len = len(df_sims)
         df_sims = df_sims.drop_duplicates(subset=['Pocket1', 'Pocket2'])
         
         if len(df_sims) < initial_len:
-            print(f"   Removed {initial_len - len(df_sims):,} duplicate comparisons")
+            logger.info(f"Removed {initial_len - len(df_sims):,} duplicate comparisons")
         
         # Sort by Pmax
         df_sims = df_sims.sort_values(by='Pmax', ascending=False).reset_index(drop=True)
@@ -492,30 +773,26 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         # Save results
         output_csv = os.path.join(output_dir, 'PocketMatch_similarities.csv')
         df_sims.to_csv(output_csv, index=False)
-        print(f"\n💾 Results saved to: {output_csv}")
+        logger.info(f"Results saved to: {output_csv}")
         
-        # Print summary statistics
-        print(f"\n📈 Summary Statistics:")
-        print(f"   Total comparisons: {len(df_sims):,}")
-        print(f"   Pmax range: {df_sims['Pmax'].min():.3f} - {df_sims['Pmax'].max():.3f}")
-        print(f"   Pmin range: {df_sims['Pmin'].min():.3f} - {df_sims['Pmin'].max():.3f}")
-        print(f"   Mean Pmax: {df_sims['Pmax'].mean():.3f}")
-        print(f"   Mean Pmin: {df_sims['Pmin'].mean():.3f}")
-        
-        # Show top 10 most similar pockets
-        print(f"\n🏆 Top 10 Most Similar Pocket Pairs (by Pmax):")
-        print(df_sims.head(10).to_string(index=False))
+        # Log summary statistics
+        logger.info(f"Summary Statistics:")
+        logger.info(f"Total comparisons: {len(df_sims):,}")
+        logger.info(f"Pmax range: {df_sims['Pmax'].min():.3f} - {df_sims['Pmax'].max():.3f}")
+        logger.info(f"Pmin range: {df_sims['Pmin'].min():.3f} - {df_sims['Pmin'].max():.3f}")
+        logger.info(f"Mean Pmax: {df_sims['Pmax'].mean():.3f}")
+        logger.info(f"Mean Pmin: {df_sims['Pmin'].mean():.3f}")
         
         return df_sims
         
     finally:
         # Cleanup temporary workspaces
         if not debug:
-            print(f"\n🧹 Cleaning up temporary workspaces...")
+            logger.info(f"Cleaning up temporary workspaces...")
             shutil.rmtree(work_dir, ignore_errors=True)
-            print(f"   ✅ Cleanup complete")
+            logger.info(f"Cleanup complete")
         else:
-            print(f"\n🔍 Debug mode: Keeping temporary workspaces at: {work_dir}")
+            logger.info(f"Debug mode: Keeping temporary workspaces at: {work_dir}")
 
 
 if __name__ == '__main__':
@@ -579,6 +856,18 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
         help='Debug mode: keep temporary workspaces for inspection'
     )
     
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Verbose mode: print detailed progress for each block and comparison'
+    )
+    
+    parser.add_argument(
+        '--test-mode',
+        action='store_true',
+        help='Test mode: process only first 3 blocks (300 pockets max) for quick testing'
+    )
+    
     args = parser.parse_args()
     
     # Convert to absolute paths
@@ -595,13 +884,15 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
             pm_base_dir,
             af_base_dir=af_base_dir,
             n_threads=args.threads,
-            debug=args.debug
+            debug=args.debug,
+            verbose=args.verbose,
+            test_mode=args.test_mode
         )
-        print("\n" + "="*80)
-        print("✅ ANALYSIS COMPLETE!")
-        print("="*80)
+        logger.info("="*80)
+        logger.info("ANALYSIS COMPLETE!")
+        logger.info("="*80)
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        logger.error(f"Error: {e}")
         import traceback
         traceback.print_exc()
         exit(1)
