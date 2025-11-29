@@ -39,14 +39,16 @@ def _setup_logger(log_path: str):
     logger.setLevel(logging.INFO)
     # Avoid adding multiple handlers on repeated calls
     if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(log_path) for h in logger.handlers):
-        # File handler
+        # File handler - captures ALL levels (DEBUG and above)
         fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.DEBUG)  # File gets everything
         fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
         fh.setFormatter(fmt)
         logger.addHandler(fh)
         
-        # Console handler (stderr) - mirrors log to terminal
+        # Console handler (stderr) - only INFO and above by default
         ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)  # Console only shows INFO+ unless verbose mode
         ch.setFormatter(fmt)
         logger.addHandler(ch)
 
@@ -506,6 +508,7 @@ def run_block_comparison(pair_id, cabbage_a, cabbage_b, mapping_a, mapping_b, pm
         # Use pre-created workspace if provided, otherwise create new one
         if isolated_pm is None:
             isolated_pm = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"cmp_{pair_id}")
+        
         # Copy cabbage files for this comparison into workspace
         local_a = os.path.join(isolated_pm, os.path.basename(cabbage_a))
         local_b = os.path.join(isolated_pm, os.path.basename(cabbage_b))
@@ -518,11 +521,28 @@ def run_block_comparison(pair_id, cabbage_a, cabbage_b, mapping_a, mapping_b, pm
         # Parse using separate mappings: first set uses mapping_a, second uses mapping_b
         df = parse_pocketmatch_output(output_file, name_mapping1=mapping_a, name_mapping2=mapping_b)
         
+        # Optionally save raw results to a separate folder (only if debug mode)
+        if debug:
+            results_dir = os.path.join(work_dir, "raw_results")
+            os.makedirs(results_dir, exist_ok=True)
+            result_file = os.path.join(results_dir, f"result_{pair_id}.txt")
+            shutil.copy2(output_file, result_file)
+        
         # Report completion to log
         completion_msg = f"Pair {pair_id}: Completed with {len(df)} comparisons"
         logger.info(completion_msg)
 
+        # IMMEDIATELY clean up workspace (don't wait for finally block)
+        # This prevents disk from getting clogged with thousands of workspaces
+        if isolated_pm and not debug:
+            try:
+                shutil.rmtree(isolated_pm, ignore_errors=False)
+                logger.debug(f"Pair {pair_id}: Cleaned up workspace")
+            except Exception as cleanup_error:
+                logger.warning(f"Pair {pair_id}: Failed to cleanup workspace: {cleanup_error}")
+        
         return df
+        
     except Exception as e:
         logger.error(f"Pair {pair_id}: Error - {e}")
         import traceback
@@ -532,9 +552,13 @@ def run_block_comparison(pair_id, cabbage_a, cabbage_b, mapping_a, mapping_b, pm
         logger.error(f"Pair {pair_id}: Traceback:\n{tb_str}")
         return pd.DataFrame()
     finally:
-        # Always clean up workspace unless debug mode
+        # Final cleanup attempt (in case immediate cleanup above failed)
         if isolated_pm and not debug:
-            shutil.rmtree(isolated_pm, ignore_errors=True)
+            if os.path.exists(isolated_pm):
+                try:
+                    shutil.rmtree(isolated_pm, ignore_errors=True)
+                except:
+                    pass  # Silent fail in finally block
 
 
 def parse_pocketmatch_output(output_file, name_mapping=None, name_mapping1=None, name_mapping2=None):
@@ -645,6 +669,10 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     _setup_logger(log_path)
     if verbose:
         logger.setLevel(logging.DEBUG)
+        # Also set console handler to DEBUG level in verbose mode
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setLevel(logging.DEBUG)
     logger.info("Starting PocketMatch analysis")
     logger.info(f"Logging to: {log_path}")
     
@@ -731,7 +759,13 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
             cmp_workspaces[pid] = ws
 
         # Run comparisons with bounded concurrency and timeouts
+        # Memory-efficient processing: save results in batches to avoid RAM overflow
+        BATCH_SIZE = 100000  # Save every 100k rows to prevent memory issues
         all_pair_results = []
+        batch_counter = 0
+        saved_chunks = []
+        chunk_dir = os.path.join(output_dir, 'result_chunks')
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
             futs = {
                 ex.submit(run_block_comparison, pid, cab_i, cab_j, map_i, map_j, pm_base_dir, work_dir, debug, verbose, cmp_workspaces[pid]): pid
@@ -750,40 +784,136 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
                     pair_id = futs[fut]
                     logger.error(f"Pair {pair_id}: Error - {e}")
                     all_pair_results.append(pd.DataFrame())
-        logger.info(f"Completed {len(all_pair_results)} block comparisons")
+                
+                # Check if we should save a batch to disk
+                valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
+                if valid_results:
+                    total_rows = sum(len(df) for df in valid_results)
+                    if total_rows >= BATCH_SIZE:
+                        logger.info(f"Saving batch {batch_counter} with ~{total_rows:,} rows to free memory...")
+                        os.makedirs(chunk_dir, exist_ok=True)
+                        chunk_file = os.path.join(chunk_dir, f'chunk_{batch_counter:04d}.csv')
+                        batch_df = pd.concat(valid_results, ignore_index=True)
+                        batch_df.to_csv(chunk_file, index=False)
+                        saved_chunks.append(chunk_file)
+                        batch_counter += 1
+                        # Clear memory
+                        all_pair_results = []
+                        del batch_df
+                        logger.info(f"Batch saved, memory cleared. Continuing...")
+        
+        logger.info(f"Completed {len(futs)} block comparisons")
 
-        # Combine results
-        logger.info(f"Combining results from {len(all_pair_results)} block comparisons...")
+        # Combine final results (remaining in-memory results + saved chunks)
+        logger.info(f"Combining results from {batch_counter} saved batches + remaining in-memory results...")
+        final_dfs = []
+        
+        # Add any remaining in-memory results
         valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
-        if not valid_results:
+        if valid_results:
+            logger.info(f"Processing {len(valid_results)} remaining in-memory results...")
+            final_dfs.extend(valid_results)
+        
+        # Load saved chunks
+        if saved_chunks:
+            logger.info(f"Loading {len(saved_chunks)} saved chunk files...")
+            for chunk_file in saved_chunks:
+                chunk_df = pd.read_csv(chunk_file)
+                final_dfs.append(chunk_df)
+                logger.debug(f"Loaded {len(chunk_df):,} rows from {os.path.basename(chunk_file)}")
+        
+        if not final_dfs:
             raise ValueError("No valid results from any comparison. Check error messages above for details.")
-        df_sims = pd.concat(valid_results, ignore_index=True)
-        logger.info(f"Aggregated results: {len(df_sims)} rows before dedup")
         
-        # Remove duplicates (typeB may create some)
-        initial_len = len(df_sims)
-        df_sims = df_sims.drop_duplicates(subset=['Pocket1', 'Pocket2'])
+        # Process and save results in chunks to avoid memory overflow
+        logger.info(f"Processing {len(final_dfs)} dataframes in batches...")
         
-        if len(df_sims) < initial_len:
-            logger.info(f"Removed {initial_len - len(df_sims):,} duplicate comparisons")
+        # Create final output directory for result files
+        results_dir = os.path.join(output_dir, 'PocketMatch_similarities')
+        os.makedirs(results_dir, exist_ok=True)
         
-        # Sort by Pmax
-        df_sims = df_sims.sort_values(by='Pmax', ascending=False).reset_index(drop=True)
+        total_rows = 0
+        total_duplicates_removed = 0
+        output_files = []
         
-        # Save results
-        output_csv = os.path.join(output_dir, 'PocketMatch_similarities.csv')
-        df_sims.to_csv(output_csv, index=False)
-        logger.info(f"Results saved to: {output_csv}")
+        # Process in batches to manage memory
+        FINAL_BATCH_SIZE = 100000
+        current_batch = []
+        current_batch_rows = 0
+        file_counter = 0
+        
+        for df in final_dfs:
+            current_batch.append(df)
+            current_batch_rows += len(df)
+            
+            if current_batch_rows >= FINAL_BATCH_SIZE:
+                # Process and save this batch
+                batch_df = pd.concat(current_batch, ignore_index=True)
+                initial_len = len(batch_df)
+                batch_df = batch_df.drop_duplicates(subset=['Pocket1', 'Pocket2'])
+                duplicates_removed = initial_len - len(batch_df)
+                total_duplicates_removed += duplicates_removed
+                
+                # Sort by Pmax
+                batch_df = batch_df.sort_values(by='Pmax', ascending=False).reset_index(drop=True)
+                
+                # Save to file
+                output_file = os.path.join(results_dir, f'similarities_part_{file_counter:04d}.csv')
+                batch_df.to_csv(output_file, index=False)
+                output_files.append(output_file)
+                
+                logger.info(f"Saved part {file_counter}: {len(batch_df):,} rows to {os.path.basename(output_file)}")
+                total_rows += len(batch_df)
+                file_counter += 1
+                
+                # Clear memory
+                current_batch = []
+                current_batch_rows = 0
+                del batch_df
+        
+        # Process remaining data
+        if current_batch:
+            batch_df = pd.concat(current_batch, ignore_index=True)
+            initial_len = len(batch_df)
+            batch_df = batch_df.drop_duplicates(subset=['Pocket1', 'Pocket2'])
+            duplicates_removed = initial_len - len(batch_df)
+            total_duplicates_removed += duplicates_removed
+            
+            batch_df = batch_df.sort_values(by='Pmax', ascending=False).reset_index(drop=True)
+            
+            output_file = os.path.join(results_dir, f'similarities_part_{file_counter:04d}.csv')
+            batch_df.to_csv(output_file, index=False)
+            output_files.append(output_file)
+            
+            logger.info(f"Saved part {file_counter}: {len(batch_df):,} rows to {os.path.basename(output_file)}")
+            total_rows += len(batch_df)
+            del batch_df
+        
+        # Clean up temporary chunk files
+        if saved_chunks and os.path.exists(chunk_dir):
+            logger.info(f"Cleaning up temporary chunk files...")
+            shutil.rmtree(chunk_dir, ignore_errors=True)
         
         # Log summary statistics
+        logger.info(f"="*80)
         logger.info(f"Summary Statistics:")
-        logger.info(f"Total comparisons: {len(df_sims):,}")
-        logger.info(f"Pmax range: {df_sims['Pmax'].min():.3f} - {df_sims['Pmax'].max():.3f}")
-        logger.info(f"Pmin range: {df_sims['Pmin'].min():.3f} - {df_sims['Pmin'].max():.3f}")
-        logger.info(f"Mean Pmax: {df_sims['Pmax'].mean():.3f}")
-        logger.info(f"Mean Pmin: {df_sims['Pmin'].mean():.3f}")
+        logger.info(f"Total output files: {len(output_files)}")
+        logger.info(f"Results directory: {results_dir}")
+        logger.info(f"Total comparisons: {total_rows:,}")
+        if total_duplicates_removed > 0:
+            logger.info(f"Removed {total_duplicates_removed:,} duplicate comparisons")
         
-        return df_sims
+        # Calculate overall statistics by reading first file as sample
+        if output_files:
+            sample_df = pd.read_csv(output_files[0])
+            logger.info(f"Sample statistics from first file:")
+            logger.info(f"  Pmax range: {sample_df['Pmax'].min():.3f} - {sample_df['Pmax'].max():.3f}")
+            logger.info(f"  Pmin range: {sample_df['Pmin'].min():.3f} - {sample_df['Pmin'].max():.3f}")
+            logger.info(f"  Mean Pmax: {sample_df['Pmax'].mean():.3f}")
+            logger.info(f"  Mean Pmin: {sample_df['Pmin'].mean():.3f}")
+            del sample_df
+        
+        return output_files
         
     finally:
         # Cleanup temporary workspaces
