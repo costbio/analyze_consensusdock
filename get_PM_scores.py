@@ -633,7 +633,7 @@ def parse_pocketmatch_output(output_file, name_mapping=None, name_mapping1=None,
     return df
 
 
-def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False, verbose=False, test_mode=False):
+def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False, verbose=False, test_mode=False, test_blocks=3, chunk_rows=100000, block_size=100):
     """
     Main function to compute PocketMatch similarities with parallelization.
     
@@ -645,7 +645,10 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         n_threads: Number of parallel threads (default: CPU count)
         debug: Whether to keep temporary files
         verbose: Whether to print detailed progress for each block/comparison
-        test_mode: Whether to run in test mode (only first 3 blocks)
+        test_mode: Whether to run in test mode (limited blocks)
+        test_blocks: Number of blocks to process in test mode (default: 3)
+        chunk_rows: Number of rows per chunk file (default: 100000)
+        block_size: Number of pockets per block (default: 100, max: 1000)
         
     Returns:
         DataFrame with pocket similarity scores
@@ -689,14 +692,19 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     if len(cavity_files) == 0:
         raise ValueError("No cavity PDB files found!")
     
-    # Divide files into fixed-size blocks for cabbage generation (max 100 per block)
-    block_size = 100
+    # Validate block size
+    if block_size < 1 or block_size > 1000:
+        raise ValueError(f"Block size must be between 1 and 1000, got {block_size}")
+    
+    logger.info(f"Using block size: {block_size} pockets per block")
+    
+    # Divide files into fixed-size blocks for cabbage generation
     blocks = [cavity_files[i:i + block_size] for i in range(0, len(cavity_files), block_size)]
     
-    # Test mode: limit to first 3 blocks for quick testing
+    # Test mode: limit to first N blocks for quick testing
     if test_mode:
-        blocks = blocks[:3]
-        logger.warning("TEST MODE: Processing only first 3 blocks (up to 300 pockets)")
+        blocks = blocks[:test_blocks]
+        logger.warning(f"TEST MODE: Processing only first {test_blocks} blocks (up to {test_blocks * block_size} pockets)")
     
     logger.info(f"Preparing {len(blocks)} cabbage blocks (size <= {block_size})")
     
@@ -751,56 +759,113 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
                 cab_j, map_j, _ = built_blocks[j]
                 pair_jobs.append((f"{i}_{j}", cab_i, cab_j, map_i, map_j))
 
-        # PRE-CREATE comparison workspaces sequentially
-        logger.info(f"Pre-creating {len(pair_jobs)} comparison workspaces sequentially...")
-        cmp_workspaces = {}
-        for pid, _, _, _, _ in tqdm(pair_jobs, desc="   Creating cmp workspaces"):
-            ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"cmp_{pid}")
-            cmp_workspaces[pid] = ws
+        # Use ON-DEMAND workspace creation to prevent disk clogging
+        # Workspaces will be created, used, and deleted immediately by each comparison
+        logger.info(f"Using on-demand workspace creation (prevents disk issues with {len(pair_jobs)} workspaces)...")
 
         # Run comparisons with bounded concurrency and timeouts
         # Memory-efficient processing: save results in batches to avoid RAM overflow
-        BATCH_SIZE = 100000  # Save every 100k rows to prevent memory issues
+        BATCH_SIZE = chunk_rows  # Use configurable chunk size
         all_pair_results = []
         batch_counter = 0
         saved_chunks = []
         chunk_dir = os.path.join(output_dir, 'result_chunks')
         
+        # Progress tracking
+        completed_count = 0
+        empty_result_count = 0
+        last_progress_log = 0
+        PROGRESS_LOG_INTERVAL = 100
+        
+        # Background I/O executor for non-blocking chunk saves
+        io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='io_saver')
+        io_futures = []  # Track background save operations
+        
+        def save_batch_background(batch_df_copy, chunk_file_path, batch_id):
+            """Save batch to disk in background thread to prevent I/O blocking."""
+            try:
+                batch_df_copy.to_csv(chunk_file_path, index=False)
+                file_size = os.path.getsize(chunk_file_path) / (1024 * 1024)
+                logger.info(f"Background save completed: batch {batch_id} ({file_size:.1f} MB)")
+                return chunk_file_path
+            except Exception as e:
+                logger.error(f"Background save failed for batch {batch_id}: {e}")
+                return None
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
             futs = {
-                ex.submit(run_block_comparison, pid, cab_i, cab_j, map_i, map_j, pm_base_dir, work_dir, debug, verbose, cmp_workspaces[pid]): pid
+                ex.submit(run_block_comparison, pid, cab_i, cab_j, map_i, map_j, pm_base_dir, work_dir, debug, verbose, None): pid
                 for (pid, cab_i, cab_j, map_i, map_j) in pair_jobs
             }
+            logger.info(f"Submitted {len(futs)} comparison jobs (on-demand workspaces)")
+            
             completed = tqdm(concurrent.futures.as_completed(futs, timeout=14400), total=len(futs), desc="   Comparisons")
             for fut in completed:
+                completed_count += 1
+                
                 try:
                     result = fut.result(timeout=300)  # 5min per comparison
                     all_pair_results.append(result)
+                    if result is None or len(result) == 0:
+                        empty_result_count += 1
                 except concurrent.futures.TimeoutError:
                     pair_id = futs[fut]
                     logger.error(f"Pair {pair_id}: Timeout after 5 minutes")
                     all_pair_results.append(pd.DataFrame())
+                    empty_result_count += 1
                 except Exception as e:
                     pair_id = futs[fut]
                     logger.error(f"Pair {pair_id}: Error - {e}")
                     all_pair_results.append(pd.DataFrame())
+                    empty_result_count += 1
+                
+                # Periodic progress logging
+                if completed_count - last_progress_log >= PROGRESS_LOG_INTERVAL:
+                    logger.info(f"Progress: {completed_count}/{len(futs)} comparisons, "
+                              f"{len(all_pair_results)} in memory, "
+                              f"{empty_result_count} empty, "
+                              f"{batch_counter} batches saved, "
+                              f"{len([f for f in io_futures if not f.done()])} saves pending")
+                    last_progress_log = completed_count
                 
                 # Check if we should save a batch to disk
                 valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
                 if valid_results:
                     total_rows = sum(len(df) for df in valid_results)
+                    logger.debug(f"Batch check: {len(valid_results)} DataFrames, {total_rows:,} rows (threshold: {BATCH_SIZE:,})")
+                    
                     if total_rows >= BATCH_SIZE:
-                        logger.info(f"Saving batch {batch_counter} with ~{total_rows:,} rows to free memory...")
+                        logger.info(f"Batch threshold reached: {total_rows:,} rows >= {BATCH_SIZE:,}")
                         os.makedirs(chunk_dir, exist_ok=True)
                         chunk_file = os.path.join(chunk_dir, f'chunk_{batch_counter:04d}.csv')
+                        
+                        # Prepare batch for background save (copy to avoid race conditions)
                         batch_df = pd.concat(valid_results, ignore_index=True)
-                        batch_df.to_csv(chunk_file, index=False)
+                        
+                        # Submit to background I/O thread
+                        logger.info(f"Submitting batch {batch_counter} to background I/O thread...")
+                        io_future = io_executor.submit(save_batch_background, batch_df.copy(), chunk_file, batch_counter)
+                        io_futures.append(io_future)
                         saved_chunks.append(chunk_file)
                         batch_counter += 1
-                        # Clear memory
+                        
+                        # Clear memory immediately (background thread has its own copy)
+                        rows_cleared = len(batch_df)
                         all_pair_results = []
                         del batch_df
-                        logger.info(f"Batch saved, memory cleared. Continuing...")
+                        logger.debug(f"Memory cleared: {rows_cleared:,} rows freed")
+        
+        # Wait for all background I/O operations to complete
+        logger.info(f"Waiting for {len(io_futures)} background save operations to complete...")
+        for i, io_fut in enumerate(io_futures):
+            try:
+                result = io_fut.result(timeout=300)
+                if result:
+                    logger.debug(f"I/O operation {i+1}/{len(io_futures)} completed: {os.path.basename(result)}")
+            except Exception as e:
+                logger.error(f"I/O operation {i+1}/{len(io_futures)} failed: {e}")
+        io_executor.shutdown(wait=True)
+        logger.info(f"All background saves completed")
         
         logger.info(f"Completed {len(futs)} block comparisons")
 
@@ -995,7 +1060,28 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
     parser.add_argument(
         '--test-mode',
         action='store_true',
-        help='Test mode: process only first 3 blocks (300 pockets max) for quick testing'
+        help='Test mode: process only first N blocks for quick testing (use --test-blocks to set N)'
+    )
+    
+    parser.add_argument(
+        '--test-blocks',
+        type=int,
+        default=3,
+        help='Number of blocks to process in test mode (default: 3, each block ~100 pockets)'
+    )
+    
+    parser.add_argument(
+        '--chunk-rows',
+        type=int,
+        default=100000,
+        help='Number of rows per chunk file when saving intermediate results (default: 100000)'
+    )
+    
+    parser.add_argument(
+        '--block-size',
+        type=int,
+        default=100,
+        help='Number of pockets per block for cabbage generation (default: 100, max: 1000)'
     )
     
     args = parser.parse_args()
@@ -1016,7 +1102,10 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
             n_threads=args.threads,
             debug=args.debug,
             verbose=args.verbose,
-            test_mode=args.test_mode
+            test_mode=args.test_mode,
+            test_blocks=args.test_blocks,
+            chunk_rows=args.chunk_rows,
+            block_size=args.block_size
         )
         logger.info("="*80)
         logger.info("ANALYSIS COMPLETE!")
