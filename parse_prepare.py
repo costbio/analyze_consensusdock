@@ -704,29 +704,329 @@ def generate_data_summary(df):
     
     return summary
 
-def export_prepared_data_optimized(df, output_dir="./"):
+def add_tool_specific_scores(df):
     """
-    High-performance data export with progress tracking.
+    Add tool-specific score columns for easier downstream analysis.
+    Creates columns like GOLD_Score, Smina_Score, LeDock_Score based on Tool1/Tool2 and Score1/Score2.
+    """
+    if df.empty or not all(col in df.columns for col in ['Tool1', 'Tool2', 'Score1', 'Score2']):
+        return df
+    
+    print(f"\n🏷️  STEP: Adding tool-specific score columns...")
+    
+    # Create score columns for each tool
+    tools = ['GOLD', 'Smina', 'LeDock']
+    for tool in tools:
+        df[f'{tool}_Score'] = np.where(
+            df['Tool1'] == tool, df['Score1'],
+            np.where(df['Tool2'] == tool, df['Score2'], np.nan)
+        )
+    
+    # Report
+    for tool in tools:
+        col_name = f'{tool}_Score'
+        non_null = df[col_name].notna().sum()
+        print(f"   {col_name}: {non_null:,} non-null values ({non_null/len(df)*100:.1f}%)")
+    
+    return df
+
+def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cluster_similarity07.csv"):
+    """
+    Integrate cavity cluster information from CavitySpace data.
+    Maps cavities to similarity clusters for cluster-based analysis.
     """
     if df.empty:
-        print("❌ No data to export")
+        return df
+    
+    print(f"\n🗃️  STEP: Integrating cavity cluster data...")
+    
+    try:
+        import re
+        
+        # Load cluster data
+        clusters_df = pd.read_csv(cluster_file, sep='\t')
+        print(f"   Loaded {len(clusters_df):,} clusters from CavitySpace")
+        
+        # Extract cavity identifiers from source_dir
+        df['extracted_uniprot_id'] = df['source_dir'].str.extract(r'_([A-Z0-9]+)_cavity_\d+')[0]
+        df['extracted_cavity_index'] = df['source_dir'].str.extract(r'cavity_(\d+)')[0].astype('Int64')
+        
+        non_null_uniprot = df['extracted_uniprot_id'].notna().sum()
+        non_null_cavity = df['extracted_cavity_index'].notna().sum()
+        print(f"   Extracted uniprot_id: {non_null_uniprot:,} non-null values")
+        print(f"   Extracted cavity_index: {non_null_cavity:,} non-null values")
+        
+        if non_null_uniprot > 0 and non_null_cavity > 0:
+            # Create cavity to cluster mapping
+            cavity_to_cluster = {}
+            successful_parses = 0
+            
+            for _, row in clusters_df.iterrows():
+                cluster_id = row['id']
+                cavity_items = row['items']
+                
+                if pd.notna(cavity_items):
+                    for cavity_id in str(cavity_items).split(','):
+                        cavity_id = cavity_id.strip()
+                        match = re.match(r'AF-([A-Z0-9]+)-F\d+-model_v1_C(\d+)', cavity_id)
+                        if match:
+                            uniprot_id, cavity_index = match.groups()
+                            cavity_to_cluster[(uniprot_id, int(cavity_index))] = cluster_id
+                            successful_parses += 1
+            
+            print(f"   Created mapping for {len(cavity_to_cluster):,} unique cavities")
+            
+            # Apply mapping
+            df['cavity_cluster_id'] = df.apply(
+                lambda row: cavity_to_cluster.get((row['extracted_uniprot_id'], row['extracted_cavity_index'])) if pd.notna(row['extracted_uniprot_id']) and pd.notna(row['extracted_cavity_index']) else pd.NA,
+                axis=1
+            )
+            
+            mapped_count = df['cavity_cluster_id'].notna().sum()
+            unique_clusters = df['cavity_cluster_id'].nunique()
+            print(f"   Mapped: {mapped_count:,}/{len(df):,} ({mapped_count/len(df)*100:.1f}%)")
+            print(f"   Unique clusters: {unique_clusters:,}")
+        else:
+            df['cavity_cluster_id'] = pd.NA
+            
+    except FileNotFoundError:
+        print(f"   ⚠️  Cluster file not found: {cluster_file}")
+        df['cavity_cluster_id'] = pd.NA
+    except Exception as e:
+        print(f"   ⚠️  Error loading clusters: {e}")
+        df['cavity_cluster_id'] = pd.NA
+    
+    return df
+
+def integrate_ic50_data(df, ic50_file="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/ic50_mapping.csv"):
+    """
+    Integrate experimental IC50/Ki measurements from Therapeutic Target Database.
+    Provides quantitative binding affinity data for validation.
+    """
+    if df.empty:
+        return df
+    
+    print(f"\n🧪 STEP: Integrating IC50 data...")
+    
+    try:
+        ic50_df = pd.read_csv(ic50_file)
+        print(f"   Loaded IC50 data: {len(ic50_df):,} measurements")
+        print(f"   Unique drugs: {ic50_df['drugbank_id'].nunique():,}")
+        print(f"   Unique targets: {ic50_df['uniprot_id'].nunique():,}")
+        
+        # Handle duplicates - keep best (lowest) IC50 per drug-target pair
+        ic50_aggregated = ic50_df.groupby(['drugbank_id', 'uniprot_id']).agg({
+            'ic50_value': 'min',
+            'ic50_unit': 'first',
+            'measurement_type': 'first',
+            'operator': 'first',
+            'pubchem_cid': 'first',
+            'activity': 'first'
+        }).reset_index()
+        ic50_aggregated['n_measurements'] = ic50_df.groupby(['drugbank_id', 'uniprot_id']).size().values
+        
+        print(f"   After aggregation: {len(ic50_aggregated):,} unique pairs")
+        
+        # Merge with docking data
+        df = df.merge(ic50_aggregated, on=['drugbank_id', 'uniprot_id'], how='left')
+        
+        matched_ic50 = df['ic50_value'].notna().sum()
+        print(f"   Matched {matched_ic50:,} docking results with IC50 data")
+        print(f"   Coverage: {matched_ic50/len(df)*100:.2f}%")
+        
+    except FileNotFoundError:
+        print(f"   ⚠️  IC50 file not found: {ic50_file}")
+        for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator', 'pubchem_cid', 'activity', 'n_measurements']:
+            df[col] = pd.NA
+    except Exception as e:
+        print(f"   ⚠️  Error loading IC50 data: {e}")
+        for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator', 'pubchem_cid', 'activity', 'n_measurements']:
+            df[col] = pd.NA
+    
+    return df
+
+def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/required_structures_with_negatives.csv"):
+    """
+    Annotate sample types (positive vs negative) based on metadata.
+    Critical for distinguishing known interactions from random controls.
+    """
+    if df.empty:
+        return df
+    
+    print(f"\n🏷️  STEP: Annotating sample types (positive vs negative)...")
+    
+    try:
+        sample_metadata = pd.read_csv(metadata_file)
+        print(f"   Loaded {len(sample_metadata):,} rows from metadata")
+        
+        # Prepare metadata for merging
+        merge_metadata = sample_metadata[['UniProt_ID', 'drugbank_id', 'Cavity_Index', 'sample_type', 'Gene_Name']].rename(
+            columns={'UniProt_ID': 'uniprot_id', 'Cavity_Index': 'cavity_index'}
+        )
+        
+        # Ensure cavity_index exists in df
+        if 'extracted_cavity_index' in df.columns:
+            df['cavity_index'] = df['extracted_cavity_index']
+        
+        # Merge
+        df = df.merge(merge_metadata, on=['uniprot_id', 'drugbank_id', 'cavity_index'], how='left')
+        
+        annotated_rows = df['sample_type'].notna().sum()
+        print(f"   Annotated: {annotated_rows:,}/{len(df):,} ({annotated_rows/len(df)*100:.1f}%)")
+        
+        if annotated_rows > 0:
+            sample_counts = df['sample_type'].value_counts()
+            print(f"   Sample type distribution:")
+            for sample_type, count in sample_counts.items():
+                print(f"      {sample_type}: {count:,}")
+        
+    except FileNotFoundError:
+        print(f"   ⚠️  Metadata file not found: {metadata_file}")
+        df['sample_type'] = pd.NA
+        df['Gene_Name'] = pd.NA
+    except Exception as e:
+        print(f"   ⚠️  Error loading metadata: {e}")
+        df['sample_type'] = pd.NA
+        df['Gene_Name'] = pd.NA
+    
+    return df
+
+def filter_complete_tool_coverage(df):
+    """
+    Filter for drug-target pairs where ALL tools made predictions.
+    Ensures fair comparison between docking tools.
+    """
+    if df.empty:
+        return df
+    
+    print(f"\n🔍 STEP: Filtering for complete tool coverage...")
+    
+    original_rows = len(df)
+    
+    # First filter for final_results source_type
+    if 'source_type' in df.columns:
+        df = df[df['source_type'] == 'final_results'].copy()
+        print(f"   After final_results filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+    
+    if 'Tool1' not in df.columns or 'Tool2' not in df.columns:
+        print(f"   ⚠️  Tool columns not found, skipping coverage filter")
+        return df
+    
+    # Define expected tools
+    expected_tools = ['GOLD', 'Smina', 'LeDock']
+    
+    # Find pairs with complete coverage
+    complete_pairs = []
+    
+    for (drug, target), group in df.groupby(['drugbank_id', 'uniprot_id']):
+        tools_in_group = set(group['Tool1'].dropna()) | set(group['Tool2'].dropna())
+        tools_present = [t for t in expected_tools if t in tools_in_group]
+        
+        if len(tools_present) == len(expected_tools):
+            complete_pairs.append((drug, target))
+    
+    if complete_pairs:
+        print(f"   Found {len(complete_pairs):,} pairs with complete tool coverage")
+        
+        # Filter for complete pairs
+        pair_set = set(complete_pairs)
+        df = df[df.apply(lambda row: (row['drugbank_id'], row['uniprot_id']) in pair_set, axis=1)].copy()
+        
+        print(f"   After coverage filter: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+    else:
+        print(f"   ⚠️  No pairs with complete tool coverage found")
+    
+    return df
+
+def balance_positive_negative_samples(df):
+    """
+    Balance positive and negative samples for each drug.
+    Ensures equal representation for unbiased evaluation.
+    """
+    if df.empty or 'sample_type' not in df.columns:
+        return df
+    
+    print(f"\n⚖️  STEP: Balancing positive/negative samples per drug...")
+    
+    original_rows = len(df)
+    
+    # Filter for drugs with both sample types
+    drugs_with_both = []
+    
+    for drug in df['drugbank_id'].unique():
+        drug_data = df[df['drugbank_id'] == drug]
+        has_positive = (drug_data['sample_type'] == 'positive').any()
+        has_negative = drug_data['sample_type'].str.contains('negative', na=False).any()
+        
+        if has_positive and has_negative:
+            n_pos = (drug_data['sample_type'] == 'positive').sum()
+            n_neg = drug_data['sample_type'].str.contains('negative', na=False).sum()
+            drugs_with_both.append((drug, min(n_pos, n_neg)))
+    
+    print(f"   Drugs with both sample types: {len(drugs_with_both):,}")
+    
+    if drugs_with_both:
+        # Balance samples for each drug
+        balanced_chunks = []
+        
+        for drug, min_count in drugs_with_both:
+            drug_data = df[df['drugbank_id'] == drug]
+            
+            pos_samples = drug_data[drug_data['sample_type'] == 'positive']
+            neg_samples = drug_data[drug_data['sample_type'].str.contains('negative', na=False)]
+            
+            if len(pos_samples) > min_count:
+                pos_samples = pos_samples.sample(n=min_count, random_state=42)
+            if len(neg_samples) > min_count:
+                neg_samples = neg_samples.sample(n=min_count, random_state=42)
+            
+            balanced_chunks.append(pos_samples)
+            balanced_chunks.append(neg_samples)
+        
+        df = pd.concat(balanced_chunks, ignore_index=True)
+        
+        print(f"   After balancing: {len(df):,} ({len(df)/original_rows*100:.1f}%)")
+        
+        # Verify balance
+        final_counts = df['sample_type'].value_counts()
+        print(f"   Final distribution:")
+        for sample_type, count in final_counts.items():
+            print(f"      {sample_type}: {count:,}")
+    
+    return df
+
+def export_prepared_data_optimized(df, output_dir="./"):
+    """
+    Export final prepared data as a single Parquet file ready for analysis.
+    No intermediate files - just the final analysis-ready dataset.
+    """
+    if df.empty:
+        print("⚠️  No data to export")
         return {}
     
-    print(f"\n💾 OPTIMIZED DATA EXPORT")
+    print(f"\n💾 EXPORTING FINAL PREPARED DATA")
     print(f"=" * 50)
+    
+    export_start = time.time()
     
     # Create output directory if needed
     if output_dir != "./":
         os.makedirs(output_dir, exist_ok=True)
     
-    export_start = time.time()
+    # Define output path for final analysis-ready file
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    final_parquet = os.path.join(output_dir, "combined_filtered_annotated_docking_results.parquet")
+    summary_path = os.path.join(output_dir, f"data_preparation_summary_{timestamp}.json")
+    
+    # Prepare export dataframe
     export_df = df.copy()
     
-    # Map columns for analysis compatibility
+    # Column mapping for consistency
     column_mapping = {
-        'score': 'Score1',
-        'binding_affinity': 'Score1',
-        'rmsd': 'RMSD',
+        'drug_id': 'drugbank_id',
+        'compound_id': 'drugbank_id',
+        'protein_id': 'uniprot_id',
+        'target_id': 'uniprot_id',
     }
     
     for old_col, new_col in column_mapping.items():
@@ -734,119 +1034,78 @@ def export_prepared_data_optimized(df, output_dir="./"):
             export_df[new_col] = export_df[old_col]
     
     # Ensure required columns exist
-    required_columns = ['drugbank_id', 'uniprot_id', 'Score1', 'RMSD']
-    for col in required_columns:
-        if col not in export_df.columns:
-            if col == 'Score1':
-                export_df[col] = export_df.get('score', float('nan'))
-            elif col == 'RMSD':
-                export_df[col] = export_df.get('rmsd', float('nan'))
-            elif col == 'drugbank_id':
-                # Try to extract from source_dir if not already extracted
-                if 'source_dir' in export_df.columns:
-                    import re
-                    def extract_drugbank_id(source_dir):
-                        if pd.isna(source_dir):
-                            return 'Unknown'
-                        dir_name = os.path.basename(str(source_dir))
-                        # Allow lowercase letters in gene_name (e.g., "nan")
-                        match = re.match(r'(DB\d+)_[A-Za-z0-9]+_[A-Z0-9]+_cavity_\d+', dir_name)
-                        return match.group(1) if match else 'Unknown'
-                    export_df[col] = export_df['source_dir'].apply(extract_drugbank_id)
-                else:
-                    export_df[col] = 'Unknown'
-            elif col == 'uniprot_id':
-                # Try to extract from source_dir if not already extracted
-                if 'source_dir' in export_df.columns:
-                    import re
-                    def extract_uniprot_id(source_dir):
-                        if pd.isna(source_dir):
-                            return 'Unknown'
-                        dir_name = os.path.basename(str(source_dir))
-                        # Allow lowercase letters in gene_name (e.g., "nan")
-                        match = re.match(r'DB\d+_[A-Za-z0-9]+_([A-Z0-9]+)_cavity_\d+', dir_name)
-                        return match.group(1) if match else 'Unknown'
-                    export_df[col] = export_df['source_dir'].apply(extract_uniprot_id)
-                else:
-                    export_df[col] = 'Unknown'
-            else:
-                export_df[col] = 'Unknown'
+    required_columns = ['drugbank_id', 'uniprot_id', 'RMSD', 'Score1', 'Score2']
+    missing_cols = [col for col in required_columns if col not in export_df.columns]
     
-    # Add Score2 if missing
-    if 'Score2' not in export_df.columns:
-        if 'consensus_score' in export_df.columns:
-            export_df['Score2'] = export_df['consensus_score']
-        elif 'energy' in export_df.columns:
-            export_df['Score2'] = export_df['energy']
-        else:
-            export_df['Score2'] = export_df['Score1']
+    if missing_cols:
+        print(f"⚠️  Missing required columns: {missing_cols}")
+        for col in missing_cols:
+            export_df[col] = pd.NA
     
-    # File paths
-    csv_path = os.path.join(output_dir, "combined_consensus_docking_results.csv")
-    parquet_path = os.path.join(output_dir, "combined_consensus_docking_results.parquet")
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    backup_csv = os.path.join(output_dir, f"backup_consensus_data_{timestamp}.csv")
-    summary_path = os.path.join(output_dir, f"data_preparation_summary_{timestamp}.json")
+    print(f"📊 Final dataset ready for export:")
+    print(f"   Records: {len(export_df):,}")
+    print(f"   Columns: {len(export_df.columns)}")
+    print(f"   Memory: {export_df.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
     
-    # Export with progress tracking
-    with tqdm(total=4, desc="💾 Exporting Files", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]") as pbar:
-        
-        # Export CSV
-        export_df.to_csv(csv_path, index=False)
-        pbar.set_postfix({'File': 'CSV'})
-        pbar.update(1)
-        
-        # Export Parquet
-        export_df.to_parquet(parquet_path, index=False)
-        pbar.set_postfix({'File': 'Parquet'})
-        pbar.update(1)
-        
-        # Export backup
-        export_df.to_csv(backup_csv, index=False)
-        pbar.set_postfix({'File': 'Backup'})
-        pbar.update(1)
-        
-        # Export summary
-        summary = generate_data_summary(export_df)
-        summary['compatibility'] = {
-            'analysis_workflow': 'compatible',
-            'expected_files_created': [
-                'combined_consensus_docking_results.csv',
-                'combined_consensus_docking_results.parquet'
-            ],
-            'required_columns_present': required_columns,
-            'column_mappings_applied': column_mapping
-        }
-        
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2, default=str)
-        pbar.set_postfix({'File': 'Summary'})
-        pbar.update(1)
+    # Export single Parquet file
+    print(f"\n💾 Saving final analysis-ready Parquet file...")
+    export_df.to_parquet(final_parquet, index=False)
+    file_size_mb = os.path.getsize(final_parquet) / (1024**2)
+    print(f"   ✅ Saved: {final_parquet} ({file_size_mb:.1f} MB)")
+    
+    # Export summary
+    summary = generate_data_summary(export_df)
+    summary['export_info'] = {
+        'timestamp': timestamp,
+        'final_output_file': final_parquet,
+        'file_size_mb': file_size_mb,
+        'processing_steps_applied': [
+            'data_loading',
+            'data_cleaning',
+            'tool_specific_scores',
+            'cavity_cluster_integration',
+            'ic50_integration',
+            'sample_type_annotation',
+            'complete_tool_coverage_filter',
+            'balanced_sampling'
+        ],
+        'analysis_ready': True
+    }
+    
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
     
     export_time = time.time() - export_start
     
-    print(f"✅ Export completed in {export_time:.2f} seconds")
+    print(f"\n✅ Export completed in {export_time:.2f} seconds")
     print(f"📄 Files created:")
-    print(f"  CSV: {csv_path}")
-    print(f"  Parquet: {parquet_path}")
-    print(f"  Backup: {backup_csv}")
-    print(f"  Summary: {summary_path}")
+    print(f"   Final Parquet: {final_parquet}")
+    print(f"   Summary: {summary_path}")
+    print(f"\n🎯 Dataset is now ready for analysis workflows!")
     
     return {
-        'csv_path': csv_path,
-        'parquet_path': parquet_path,
-        'backup_path': backup_csv,
+        'parquet_path': final_parquet,
         'summary_path': summary_path,
-        'compatible_with_analysis': True
+        'analysis_ready': True
     }
 
 def main():
     """
     Main execution function with comprehensive performance monitoring.
+    Now includes all notebook processing steps for complete analysis-ready data.
     """
     total_start_time = time.time()
     
-    print("🚀 HIGH-PERFORMANCE CONSENSUS DOCKING DATA PARSER")
+    print("🚀 COMPREHENSIVE CONSENSUS DOCKING DATA PREPARATION")
+    print("=" * 60)
+    print("This script integrates all preprocessing steps:")
+    print("  ✓ Data loading and cleaning")
+    print("  ✓ Tool-specific score columns")
+    print("  ✓ Cavity cluster integration")
+    print("  ✓ IC50 experimental data")
+    print("  ✓ Sample type annotation")
+    print("  ✓ Complete tool coverage filtering")
+    print("  ✓ Balanced positive/negative sampling")
     print("=" * 60)
     
     system_info = get_system_info()
@@ -854,9 +1113,12 @@ def main():
     print(f"💾 Available: {system_info['available_memory_gb']:.1f}GB")
     
     # Step 1: File Discovery
+    print(f"\n{'='*60}")
+    print(f"PHASE 1: FILE DISCOVERY")
+    print(f"{'='*60}")
     result_files = find_consensus_results_files_optimized(
         base_directory="/media/onur/Elements/cavity_space_consensus_docking",
-        max_workers=min(multiprocessing.cpu_count(), 12)  # Cap workers for I/O
+        max_workers=min(multiprocessing.cpu_count(), 12)
     )
     
     total_files = sum(len(files) for files in result_files.values())
@@ -865,9 +1127,12 @@ def main():
         return
     
     # Step 2: Data Loading
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: DATA LOADING")
+    print(f"{'='*60}")
     consensus_data = load_consensus_data_optimized(
         result_files, 
-        max_workers=min(8, system_info['cpu_count'])  # Optimal for I/O bound loading
+        max_workers=min(8, system_info['cpu_count'])
     )
     
     if consensus_data.empty:
@@ -875,24 +1140,56 @@ def main():
         return
     
     # Step 3: Data Cleaning
+    print(f"\n{'='*60}")
+    print(f"PHASE 3: DATA CLEANING")
+    print(f"{'='*60}")
     cleaned_data = clean_and_prepare_data_optimized(consensus_data)
     
-    # Step 4: Data Export
-    export_results = export_prepared_data_optimized(cleaned_data, output_dir="./")
+    # Step 4: Add Tool-Specific Scores
+    print(f"\n{'='*60}")
+    print(f"PHASE 4: ENRICHMENT & ANNOTATION")
+    print(f"{'='*60}")
+    cleaned_data = add_tool_specific_scores(cleaned_data)
+    
+    # Step 5: Integrate Cavity Clusters
+    cleaned_data = integrate_cavity_clusters(cleaned_data)
+    
+    # Step 6: Integrate IC50 Data
+    cleaned_data = integrate_ic50_data(cleaned_data)
+    
+    # Step 7: Annotate Sample Types
+    cleaned_data = annotate_sample_types(cleaned_data)
+    
+    # Step 8: Filter for Complete Tool Coverage
+    print(f"\n{'='*60}")
+    print(f"PHASE 5: FILTERING & BALANCING")
+    print(f"{'='*60}")
+    cleaned_data = filter_complete_tool_coverage(cleaned_data)
+    
+    # Step 9: Balance Positive/Negative Samples
+    cleaned_data = balance_positive_negative_samples(cleaned_data)
+    
+    # Step 10: Data Export
+    print(f"\n{'='*60}")
+    print(f"PHASE 6: FINAL EXPORT")
+    print(f"{'='*60}")
+    export_results = export_prepared_data_optimized(cleaned_data, output_dir="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/")
     
     # Final Performance Summary
     total_time = time.time() - total_start_time
     
-    print(f"\n🎉 PROCESSING COMPLETE")
+    print(f"\n🎉 PROCESSING COMPLETE!")
     print(f"=" * 60)
-    print(f"⏱️  Total execution time: {total_time:.2f} seconds")
-    print(f"📊 Total records processed: {len(cleaned_data):,}")
+    print(f"⏱️  Total execution time: {total_time:.2f} seconds ({total_time/60:.1f} minutes)")
+    print(f"📊 Final records: {len(cleaned_data):,}")
     print(f"⚡ Processing rate: {len(cleaned_data)/total_time:,.0f} records/sec")
-    print(f"💾 Final memory usage: {cleaned_data.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
+    print(f"💾 Memory usage: {cleaned_data.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
     
-    if export_results.get('compatible_with_analysis'):
-        print(f"\n✅ Files ready for analysis workflow!")
-        print(f"🚀 You can now run the Jupyter notebook analysis.")
+    if export_results.get('analysis_ready'):
+        print(f"\n✅ Analysis-ready file created!")
+        print(f"📁 Output: {export_results['parquet_path']}")
+        print(f"\n🚀 You can now run analysis notebooks directly!")
+        print(f"   No need to run notebook preprocessing steps.")
     
     return cleaned_data, export_results
 

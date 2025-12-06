@@ -13,6 +13,7 @@ Output: CSV file with pairwise pocket similarity scores
 """
 
 import pandas as pd
+import numpy as np
 import subprocess
 import os
 import glob
@@ -28,6 +29,8 @@ import json
 import logging
 import faulthandler
 import signal
+import time
+import re
 from biopandas.pdb import PandasPdb
 
 faulthandler.register(signal.SIGUSR1)
@@ -142,6 +145,16 @@ def extract_complete_residues_from_cavity(args):
     
     simple_name = f"p{idx+1}.pdb"
     original_name = os.path.basename(pocket_file)
+    
+    # If af_base_dir is None, we cannot extract complete residues
+    # Just copy the cavity file as-is (may cause issues with PocketMatch)
+    if af_base_dir is None:
+        try:
+            shutil.copy2(pocket_file, dest_file)
+            return (simple_name, original_name, True)
+        except Exception as e:
+            logger.warning(f"Failed to copy {original_name}: {e}")
+            return (simple_name, original_name, False)
     
     try:
         # Parse cavity file using BioPandas to get residue information
@@ -272,6 +285,7 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     
     # Extract COMPLETE RESIDUES from AlphaFold structures in parallel
     # Use simple numeric names to avoid issues with long names or special characters
+    # If af_base_dir is None, just copy cavity files directly (faster for resume mode)
     name_mapping = {}
     
     # Prepare arguments for parallel processing
@@ -289,8 +303,12 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     
     # Process residue extraction in parallel with timeout
     # Use ProcessPoolExecutor for true parallelism (bypasses Python GIL)
+    # If af_base_dir is None, this just copies files (WARNING: may not work with PocketMatch)
     results = []
-    logger.debug(f"Extracting complete residues from {len(pocket_files)} cavity files using {max_workers} workers...")
+    if af_base_dir is None:
+        logger.warning(f"No AlphaFold base directory provided - copying cavity files as-is (may cause PocketMatch errors)")
+    else:
+        logger.debug(f"Extracting complete residues from {len(pocket_files)} cavity files using {max_workers} workers...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks and track futures
         future_to_idx = {executor.submit(extract_complete_residues_from_cavity, args): i for i, args in enumerate(args_list)}
@@ -561,6 +579,324 @@ def run_block_comparison(pair_id, cabbage_a, cabbage_b, mapping_a, mapping_b, pm
                     pass  # Silent fail in finally block
 
 
+def parse_previous_run_config(output_dir):
+    """
+    Parse the previous run's log file to extract exact configuration parameters.
+    
+    Args:
+        output_dir: Output directory containing pocketmatch_progress.log
+        
+    Returns:
+        Dict with config parameters or None if log not found
+    """
+    log_path = os.path.join(output_dir, 'pocketmatch_progress.log')
+    
+    if not os.path.exists(log_path):
+        logger.warning(f"No previous log file found at {log_path}")
+        return None
+    
+    config = {
+        'num_cavities': None,
+        'num_blocks': None,
+        'block_size': None,
+        'test_mode': False,
+        'test_blocks': None,
+        'total_pairs': None,
+        'cavities_dir': None
+    }
+    
+    logger.info(f"Parsing previous run configuration from {log_path}")
+    
+    with open(log_path, 'r') as f:
+        for line in f:
+            # Extract cavity count: "Found 38,709 cavity PDB files"
+            if 'Found' in line and 'cavity PDB files' in line:
+                match = re.search(r'Found ([0-9,]+) cavity PDB files', line)
+                if match:
+                    config['num_cavities'] = int(match.group(1).replace(',', ''))
+            
+            # Extract block info: "Preparing 388 cabbage blocks (size <= 100)"
+            elif 'Preparing' in line and 'cabbage blocks' in line:
+                match = re.search(r'Preparing (\d+) cabbage blocks \(size <= (\d+)\)', line)
+                if match:
+                    config['num_blocks'] = int(match.group(1))
+                    config['block_size'] = int(match.group(2))
+            
+            # Extract test mode: "TEST MODE: Processing only first 3 blocks"
+            elif 'TEST MODE:' in line:
+                config['test_mode'] = True
+                match = re.search(r'Processing only first (\d+) blocks', line)
+                if match:
+                    config['test_blocks'] = int(match.group(1))
+            
+            # Extract total pairs: "Submitting 75,466 block comparisons"
+            elif 'Submitting' in line and 'block comparisons' in line:
+                match = re.search(r'Submitting ([0-9,]+) block comparisons', line)
+                if match:
+                    config['total_pairs'] = int(match.group(1).replace(',', ''))
+            
+            # Extract cavities directory: "Collecting cavity PDB files from: /path/to/cavities"
+            elif 'Collecting cavity PDB files from:' in line:
+                match = re.search(r'Collecting cavity PDB files from: (.+)$', line)
+                if match:
+                    config['cavities_dir'] = match.group(1).strip()
+    
+    # Validate we got essential info
+    if config['num_blocks'] is None or config['block_size'] is None:
+        logger.error("Could not extract essential config from log file")
+        return None
+    
+    logger.info(f"Previous run config: {config['num_blocks']} blocks (size <= {config['block_size']})")
+    if config['test_mode']:
+        logger.info(f"Previous run was in TEST MODE with {config['test_blocks']} blocks")
+    
+    return config
+
+
+def reconstruct_pocket_to_block_mapping(cavity_files, block_size):
+    """
+    Reconstruct which block each pocket belongs to based on sorted order and block size.
+    This recreates the exact same partitioning as the original run.
+    
+    Args:
+        cavity_files: Sorted list of cavity file paths (same order as original run)
+        block_size: Number of pockets per block
+        
+    Returns:
+        Dict mapping pocket filename -> block_index
+    """
+    pocket_to_block = {}
+    
+    for idx, cavity_file in enumerate(cavity_files):
+        block_idx = idx // block_size
+        pocket_name = os.path.basename(cavity_file)
+        pocket_to_block[pocket_name] = block_idx
+    
+    return pocket_to_block
+
+
+def identify_completed_block_pairs(output_dir, pocket_to_block_map, n_threads=None):
+    """
+    Identify which block pairs have already been compared by analyzing result chunks in parallel.
+    
+    Args:
+        output_dir: Output directory containing result_chunks folder
+        pocket_to_block_map: Dict mapping pocket filename -> block_index
+        n_threads: Number of parallel threads (default: CPU count)
+        
+    Returns:
+        Tuple of (completed_pairs set, pockets_with_results set)
+        - completed_pairs: Set of pair IDs like "0_1", "2_3"
+        - pockets_with_results: Set of pocket filenames that appear in results
+    """
+    chunk_dir = os.path.join(output_dir, 'result_chunks')
+    completed_pairs = set()
+    pockets_with_results = set()
+    
+    if not os.path.exists(chunk_dir):
+        logger.info("No result_chunks directory found - no completed pairs")
+        return completed_pairs, pockets_with_results
+    
+    # Read all existing chunk files to find completed comparisons
+    chunk_files = sorted(glob.glob(os.path.join(chunk_dir, 'chunk_*.csv')))
+    
+    if not chunk_files:
+        logger.info("No chunk files found - no completed pairs")
+        return completed_pairs, pockets_with_results
+    
+    logger.info(f"Analyzing {len(chunk_files)} existing chunk files to identify completed block pairs...")
+    
+    if n_threads is None:
+        n_threads = cpu_count()
+    
+    def process_chunk_file(chunk_file):
+        """Process a single chunk file and return local results using vectorized operations."""
+        local_pairs = {}  # (i, j) -> count
+        local_pockets = set()
+        
+        try:
+            df = pd.read_csv(chunk_file)
+            if len(df) == 0 or 'Pocket1' not in df.columns or 'Pocket2' not in df.columns:
+                return local_pairs, local_pockets
+            
+            # Vectorized operations - 100-1000x faster than iterrows()
+            pocket1_series = df['Pocket1']
+            pocket2_series = df['Pocket2']
+            
+            # Track pockets that have results (vectorized)
+            local_pockets.update(pocket1_series.unique())
+            local_pockets.update(pocket2_series.unique())
+            
+            # Map pockets to blocks (vectorized)
+            block1_series = pocket1_series.map(pocket_to_block_map)
+            block2_series = pocket2_series.map(pocket_to_block_map)
+            
+            # Filter out rows where mapping failed
+            valid_mask = block1_series.notna() & block2_series.notna()
+            if not valid_mask.any():
+                return local_pairs, local_pockets
+            
+            block1_valid = block1_series[valid_mask].astype(int).values
+            block2_valid = block2_series[valid_mask].astype(int).values
+            
+            # Create normalized pairs (i <= j) - vectorized
+            block_min = np.minimum(block1_valid, block2_valid)
+            block_max = np.maximum(block1_valid, block2_valid)
+            
+            # Create DataFrame for grouping
+            pairs_df = pd.DataFrame({'i': block_min, 'j': block_max})
+            
+            # Count occurrences of each pair
+            pair_counts = pairs_df.groupby(['i', 'j']).size()
+            
+            # Convert to dict
+            for (i, j), count in pair_counts.items():
+                local_pairs[(i, j)] = count
+                    
+        except Exception as e:
+            logger.warning(f"Error reading {os.path.basename(chunk_file)}: {e}")
+        
+        return local_pairs, local_pockets
+    
+    # Process chunk files in parallel
+    block_pair_counts = {}  # (i, j) -> count of comparisons
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+        futures = [executor.submit(process_chunk_file, cf) for cf in chunk_files]
+        
+        # Collect results with progress bar
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="   Analyzing chunks"):
+            try:
+                local_pairs, local_pockets = future.result()
+                
+                # Merge local results into global counts
+                for pair_key, count in local_pairs.items():
+                    block_pair_counts[pair_key] = block_pair_counts.get(pair_key, 0) + count
+                
+                pockets_with_results.update(local_pockets)
+            except Exception as e:
+                logger.warning(f"Error processing chunk future: {e}")
+    
+    logger.info(f"Found {len(pockets_with_results):,} unique pockets in results")
+    logger.info(f"Found results for {len(block_pair_counts)} block pairs")
+    
+    # Mark any pair with results as "completed"
+    for pair_key, count in block_pair_counts.items():
+        i, j = pair_key
+        pair_id = f"{i}_{j}"
+        completed_pairs.add(pair_id)
+        logger.debug(f"Block pair {pair_id}: {count} comparisons found")
+    
+    logger.info(f"Identified {len(completed_pairs)} completed block pairs")
+    return completed_pairs, pockets_with_results
+
+
+def identify_blocks_to_build(total_blocks, completed_pairs):
+    """
+    Identify which blocks need to be built based on remaining comparisons.
+    
+    Args:
+        total_blocks: Total number of blocks
+        completed_pairs: Set of completed pair IDs (e.g., "0_1")
+        
+    Returns:
+        Set of block indices that need to be built
+    """
+    needed_blocks = set()
+    
+    # Check all possible pairs in upper triangle
+    for i in range(total_blocks):
+        for j in range(i, total_blocks):
+            pair_id = f"{i}_{j}"
+            if pair_id not in completed_pairs:
+                # This pair needs to be compared, so we need both blocks
+                needed_blocks.add(i)
+                needed_blocks.add(j)
+    
+    return needed_blocks
+
+
+def get_next_chunk_counter(output_dir):
+    """
+    Determine the next chunk counter to use based on existing chunks.
+    
+    Args:
+        output_dir: Output directory containing result_chunks folder
+        
+    Returns:
+        Next chunk counter to use
+    """
+    chunk_dir = os.path.join(output_dir, 'result_chunks')
+    
+    if not os.path.exists(chunk_dir):
+        return 0
+    
+    chunk_files = glob.glob(os.path.join(chunk_dir, 'chunk_*.csv'))
+    
+    if not chunk_files:
+        return 0
+    
+    # Extract counter from each filename
+    counters = []
+    for chunk_file in chunk_files:
+        basename = os.path.basename(chunk_file)
+        # Extract number from chunk_XXXX.csv
+        match = re.match(r'chunk_(\d+)\.csv', basename)
+        if match:
+            counters.append(int(match.group(1)))
+    
+    if counters:
+        next_counter = max(counters) + 1
+        logger.info(f"Resuming chunk numbering from {next_counter}")
+        return next_counter
+    
+    return 0
+
+
+def validate_resume_parameters(args, prev_config):
+    """
+    Validate that current parameters match previous run for safe resumption.
+    
+    Args:
+        args: Current command-line arguments
+        prev_config: Previous run configuration from log
+        
+    Returns:
+        True if parameters are compatible, False otherwise
+    """
+    errors = []
+    
+    # Block size must match
+    if prev_config['block_size'] != args.block_size:
+        errors.append(f"Block size mismatch: previous={prev_config['block_size']}, current={args.block_size}")
+    
+    # Test mode consistency
+    if prev_config['test_mode'] != args.test_mode:
+        if prev_config['test_mode']:
+            errors.append(f"Cannot resume from test mode run in full mode")
+        else:
+            errors.append(f"Cannot resume from full run in test mode")
+    
+    # If both test mode, test_blocks must match
+    if prev_config['test_mode'] and args.test_mode:
+        if prev_config['test_blocks'] != args.test_blocks:
+            errors.append(f"Test blocks mismatch: previous={prev_config['test_blocks']}, current={args.test_blocks}")
+    
+    # Cavities directory should match (if we have it)
+    if prev_config['cavities_dir'] and prev_config['cavities_dir'] != args.cavities:
+        logger.warning(f"Cavities directory changed: previous={prev_config['cavities_dir']}, current={args.cavities}")
+        logger.warning("This may cause issues if cavity files have changed")
+    
+    if errors:
+        logger.error("Resume parameter validation failed:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        return False
+    
+    logger.info("✅ Resume parameters validated successfully")
+    return True
+
+
 def parse_pocketmatch_output(output_file, name_mapping=None, name_mapping1=None, name_mapping2=None):
     """
     Parse PocketMatch output file into a DataFrame.
@@ -633,7 +969,7 @@ def parse_pocketmatch_output(output_file, name_mapping=None, name_mapping1=None,
     return df
 
 
-def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False, verbose=False, test_mode=False, test_blocks=3, chunk_rows=100000, block_size=100):
+def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_dir=None, n_threads=None, debug=False, verbose=False, test_mode=False, test_blocks=3, chunk_rows=100000, block_size=100, resume=False):
     """
     Main function to compute PocketMatch similarities with parallelization.
     
@@ -649,6 +985,7 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         test_blocks: Number of blocks to process in test mode (default: 3)
         chunk_rows: Number of rows per chunk file (default: 100000)
         block_size: Number of pockets per block (default: 100, max: 1000)
+        resume: Whether to resume from existing progress (default: False)
         
     Returns:
         DataFrame with pocket similarity scores
@@ -668,7 +1005,12 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     os.makedirs(output_dir, exist_ok=True)
     
     # Setup file logger after output directory exists
-    log_path = os.path.join(output_dir, 'pocketmatch_progress.log')
+    if resume:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(output_dir, f'pocketmatch_resume_{timestamp}.log')
+        logger.info(f"RESUME MODE: Creating new log file")
+    else:
+        log_path = os.path.join(output_dir, 'pocketmatch_progress.log')
     _setup_logger(log_path)
     if verbose:
         logger.setLevel(logging.DEBUG)
@@ -713,51 +1055,194 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
     os.makedirs(work_dir, exist_ok=True)
     
     try:
-        # PRE-CREATE all workspaces sequentially to avoid "too many open files" errors
-        logger.info(f"Pre-creating {len(blocks)} workspaces sequentially...")
-        block_workspaces = {}
-        for i in tqdm(range(len(blocks)), desc="   Creating workspaces"):
-            ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"blk_{i}")
-            block_workspaces[i] = ws
+        # RESUME MODE: Parse previous run and validate parameters
+        if resume:
+            logger.info("="*80)
+            logger.info("RESUME MODE ACTIVATED")
+            logger.info("="*80)
+            
+            # Parse previous run configuration
+            prev_config = parse_previous_run_config(output_dir)
+            if prev_config is None:
+                logger.error("Cannot resume: Failed to parse previous run configuration")
+                logger.error("Make sure the output directory contains a valid pocketmatch_progress.log file")
+                return pd.DataFrame()
+            
+            # Validate current parameters match previous run
+            current_params = argparse.Namespace(
+                block_size=block_size,
+                test_mode=test_mode,
+                test_blocks=test_blocks,
+                cavities=cavities_dir
+            )
+            
+            if not validate_resume_parameters(current_params, prev_config):
+                logger.error("Resume aborted due to parameter mismatch")
+                logger.error("To resume, use the same parameters as the previous run:")
+                logger.error(f"  --block-size {prev_config['block_size']}")
+                if prev_config['test_mode']:
+                    logger.error(f"  --test-mode --test-blocks {prev_config['test_blocks']}")
+                return pd.DataFrame()
+            
+            # Reconstruct pocket-to-block mapping from current cavity files
+            logger.info("Reconstructing block structure from cavity files...")
+            pocket_to_block_map = reconstruct_pocket_to_block_mapping(cavity_files, block_size)
+            logger.info(f"Mapped {len(pocket_to_block_map):,} pockets to {len(blocks)} blocks")
+            
+            # Identify which block pairs have already been completed
+            logger.info("Analyzing existing result chunks to identify completed comparisons...")
+            completed_pairs, pockets_with_results = identify_completed_block_pairs(output_dir, pocket_to_block_map, n_threads)
+            
+            total_pairs = len(blocks) * (len(blocks) + 1) // 2
+            remaining_pairs = total_pairs - len(completed_pairs)
+            
+            logger.info(f"Resume summary:")
+            logger.info(f"  - Total blocks: {len(blocks)}")
+            logger.info(f"  - Total possible pairs: {total_pairs:,}")
+            logger.info(f"  - Completed pairs: {len(completed_pairs):,}")
+            logger.info(f"  - Remaining pairs: {remaining_pairs:,}")
+            
+            if remaining_pairs == 0:
+                logger.info("\u2705 All comparisons already completed! Nothing to do.")
+                logger.info(f"Results are in: {os.path.join(output_dir, 'result_chunks')}")
+                return pd.DataFrame()
+            
+            # Identify which blocks need to be built for remaining comparisons
+            logger.info("Identifying which blocks need to be built...")
+            blocks_to_build = identify_blocks_to_build(len(blocks), completed_pairs)
+            logger.info(f"Need to build {len(blocks_to_build)} blocks (out of {len(blocks)} total)")
+            
+            # Build only the needed blocks
+            logger.info("Building required cabbage blocks...")
+            built_blocks = [None] * len(blocks)  # Placeholder for all blocks
+            
+            # Pre-create workspaces only for needed blocks
+            block_workspaces = {}
+            for i in tqdm(sorted(blocks_to_build), desc="   Creating workspaces"):
+                ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"blk_{i}")
+                block_workspaces[i] = ws
+            
+            # Build needed blocks in parallel
+            # In resume mode: use more aggressive parallelism within each block
+            # Since we're building fewer blocks, we can afford more workers per block
+            workers_per_block = max(1, n_threads // max(1, len(blocks_to_build)))
+            workers_per_block = min(workers_per_block, cpu_count())  # Cap at CPU count
+            
+            logger.info(f"Resume mode: Using {n_threads} parallel block builders, each with {workers_per_block} internal workers")
+            logger.info(f"This parallelizes AlphaFold residue extraction more aggressively")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+                futures = {
+                    ex.submit(build_cabbage_block, i, blocks[i], pm_base_dir, work_dir, af_base_dir, workers_per_block, False, verbose, block_workspaces[i]): i
+                    for i in blocks_to_build
+                }
+                completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
+                for fut in completed:
+                    try:
+                        result = fut.result(timeout=1200)
+                        block_idx = futures[fut]
+                        built_blocks[block_idx] = result
+                    except concurrent.futures.TimeoutError:
+                        block_id = futures[fut]
+                        logger.error(f"Block {block_id}: Timeout after 20 minutes")
+                    except Exception as e:
+                        block_id = futures[fut]
+                        logger.error(f"Block {block_id}: Error - {e}")
+            
+            logger.info(f"Built {len(blocks_to_build)} cabbage blocks successfully")
+            
+            # Clean up temp workspaces
+            for i in blocks_to_build:
+                if built_blocks[i] is not None:
+                    _, _, ws = built_blocks[i]
+                    shutil.rmtree(ws, ignore_errors=True)
+            
+        else:
+            completed_pairs = set()
+            built_blocks = None
         
-        # Generate all cabbage blocks in parallel using pre-created workspaces
-        logger.info("Generating cabbage blocks in parallel...")
-        built_blocks = []  # list of (cabbage_path, mapping, tmp_workspace)
+        # Generate ALL blocks if fresh start
+        if built_blocks is None:
+            # PRE-CREATE all workspaces sequentially to avoid "too many open files" errors
+            logger.info(f"Pre-creating {len(blocks)} workspaces sequentially...")
+            block_workspaces = {}
+            for i in tqdm(range(len(blocks)), desc="   Creating workspaces"):
+                ws = create_isolated_pocketmatch_workspace(pm_base_dir, work_dir, f"blk_{i}")
+                block_workspaces[i] = ws
+            
+            # Generate all cabbage blocks in parallel using pre-created workspaces
+            logger.info("Generating cabbage blocks in parallel...")
+            built_blocks = []  # list of (cabbage_path, mapping, tmp_workspace)
         
-        # Each block processes files with 1 worker internally (sequential per block)
-        # But we run n_threads blocks in parallel
-        logger.info(f"Using {n_threads} parallel blocks (each processes files with 1 worker)")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
-            futures = {
-                ex.submit(build_cabbage_block, i, blk, pm_base_dir, work_dir, af_base_dir, 1, False, verbose, block_workspaces[i]): i
-                for i, blk in enumerate(blocks)
-            }
-            completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
-            for fut in completed:
-                try:
-                    result = fut.result(timeout=1200)  # 20min per block
-                    built_blocks.append(result)
-                except concurrent.futures.TimeoutError:
-                    block_id = futures[fut]
-                    logger.error(f"Block {block_id}: Timeout after 20 minutes")
-                except Exception as e:
-                    block_id = futures[fut]
-                    logger.error(f"Block {block_id}: Error - {e}")
-        logger.info(f"Built {len(built_blocks)} cabbage blocks successfully")
+            # Each block processes files with 1 worker internally (sequential per block)
+            # But we run n_threads blocks in parallel
+            logger.info(f"Using {n_threads} parallel blocks (each processes files with 1 worker)")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+                futures = {
+                    ex.submit(build_cabbage_block, i, blk, pm_base_dir, work_dir, af_base_dir, 1, False, verbose, block_workspaces[i]): i
+                    for i, blk in enumerate(blocks)
+                }
+                completed = tqdm(concurrent.futures.as_completed(futures, timeout=7200), total=len(futures), desc="   Blocks")
+                for fut in completed:
+                    try:
+                        result = fut.result(timeout=1200)  # 20min per block
+                        built_blocks.append(result)
+                    except concurrent.futures.TimeoutError:
+                        block_id = futures[fut]
+                        logger.error(f"Block {block_id}: Timeout after 20 minutes")
+                    except Exception as e:
+                        block_id = futures[fut]
+                        logger.error(f"Block {block_id}: Error - {e}")
+                logger.info(f"Built {len(built_blocks)} cabbage blocks successfully")
 
-        # Clean up temp workspaces used for building (keep only block files)
-        for _, _, ws in built_blocks:
-            shutil.rmtree(ws, ignore_errors=True)
+                # Clean up temp workspaces used for building (keep only block files)
+                for _, _, ws in built_blocks:
+                    shutil.rmtree(ws, ignore_errors=True)
 
         # Prepare all pairwise comparisons between blocks (including self)
-        total_pairs = (len(built_blocks) * (len(built_blocks) + 1)) // 2
-        logger.info(f"Submitting {total_pairs} block comparisons (upper triangle)...")
-        pair_jobs = []
-        for i, (cab_i, map_i, _) in enumerate(built_blocks):
-            for j in range(i, len(built_blocks)):
-                cab_j, map_j, _ = built_blocks[j]
-                pair_jobs.append((f"{i}_{j}", cab_i, cab_j, map_i, map_j))
+        # Handle both fresh start (list of tuples) and resume (list with None placeholders)
+        if resume:
+            # Resume mode: built_blocks is a list with None placeholders
+            # Only iterate over non-None entries
+            total_pairs = len(blocks) * (len(blocks) + 1) // 2
+            pair_jobs = []
+            
+            for i in range(len(blocks)):
+                for j in range(i, len(blocks)):
+                    pair_id = f"{i}_{j}"
+                    
+                    # Skip if this pair was already completed
+                    if pair_id in completed_pairs:
+                        logger.debug(f"Skipping completed pair {pair_id}")
+                        continue
+                    
+                    # Only add if both blocks were built
+                    if built_blocks[i] is not None and built_blocks[j] is not None:
+                        cab_i, map_i, _ = built_blocks[i]
+                        cab_j, map_j, _ = built_blocks[j]
+                        pair_jobs.append((pair_id, cab_i, cab_j, map_i, map_j))
+                    else:
+                        logger.error(f"Cannot compare pair {pair_id}: block(s) not built")
+            
+            logger.info(f"After filtering completed pairs: {len(pair_jobs)} comparisons remaining (out of {total_pairs} total)")
+        else:
+            # Fresh start: built_blocks is a list of tuples
+            total_pairs = (len(built_blocks) * (len(built_blocks) + 1)) // 2
+            pair_jobs = []
+            
+            for i, (cab_i, map_i, _) in enumerate(built_blocks):
+                for j in range(i, len(built_blocks)):
+                    cab_j, map_j, _ = built_blocks[j]
+                    pair_id = f"{i}_{j}"
+                    pair_jobs.append((pair_id, cab_i, cab_j, map_i, map_j))
+            
+            logger.info(f"Submitting {total_pairs} block comparisons (upper triangle)...")
+        
+        if len(pair_jobs) == 0:
+            logger.info("\u2705 All comparisons already completed! Nothing to do.")
+            logger.info(f"Results are in: {os.path.join(output_dir, 'result_chunks')}")
+            return pd.DataFrame()  # Return empty, user should merge existing chunks
 
         # Use ON-DEMAND workspace creation to prevent disk clogging
         # Workspaces will be created, used, and deleted immediately by each comparison
@@ -767,7 +1252,14 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
         # Memory-efficient processing: save results in batches to avoid RAM overflow
         BATCH_SIZE = chunk_rows  # Use configurable chunk size
         all_pair_results = []
-        batch_counter = 0
+        
+        # In resume mode, start from next available chunk number
+        if resume:
+            batch_counter = get_next_chunk_counter(output_dir)
+            logger.info(f"Resume mode: Starting from chunk {batch_counter}")
+        else:
+            batch_counter = 0
+        
         saved_chunks = []
         chunk_dir = os.path.join(output_dir, 'result_chunks')
         
@@ -1084,6 +1576,12 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
         help='Number of pockets per block for cabbage generation (default: 100, max: 1000)'
     )
     
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume from existing progress (reuses existing blocks and continues from last chunk)'
+    )
+    
     args = parser.parse_args()
     
     # Convert to absolute paths
@@ -1105,7 +1603,8 @@ Note: Uses PocketMatch Step3-PM_typeB for parallelization.
             test_mode=args.test_mode,
             test_blocks=args.test_blocks,
             chunk_rows=args.chunk_rows,
-            block_size=args.block_size
+            block_size=args.block_size,
+            resume=args.resume
         )
         logger.info("="*80)
         logger.info("ANALYSIS COMPLETE!")
