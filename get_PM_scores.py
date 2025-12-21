@@ -59,6 +59,7 @@ def _setup_logger(log_path: str):
 def collect_cavity_files(cavities_dir):
     """
     Collect all cavity PDB files from subdirectories.
+    Uses os.scandir() for much faster directory traversal on large directories.
     
     Args:
         cavities_dir: Path to extracted_cavities directory
@@ -66,10 +67,39 @@ def collect_cavity_files(cavities_dir):
     Returns:
         List of paths to cavity PDB files
     """
+    import re
+    
     logger.info(f"Collecting cavity PDB files from: {cavities_dir}")
     
-    # Find all cavity PDB files (not vacant files)
-    cavity_files = list(Path(cavities_dir).glob("*/AF-*_cavity_*.pdb"))
+    # Use os.scandir for fast directory iteration (much faster than glob for large dirs)
+    # Pattern: AF-*_cavity_*.pdb (excluding vacant files)
+    cavity_pattern = re.compile(r'^AF-.*_cavity_\d+\.pdb$')
+    cavity_files = []
+    
+    try:
+        # First level: iterate through subdirectories
+        with os.scandir(cavities_dir) as entries:
+            subdirs = [entry.path for entry in entries if entry.is_dir()]
+        
+        logger.info(f"Found {len(subdirs):,} subdirectories to scan")
+        
+        # Second level: iterate through files in each subdirectory
+        for i, subdir in enumerate(subdirs):
+            try:
+                with os.scandir(subdir) as files:
+                    for f in files:
+                        if f.is_file() and cavity_pattern.match(f.name):
+                            cavity_files.append(Path(f.path))
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Could not scan {subdir}: {e}")
+            
+            # Progress update every 5000 directories
+            if (i + 1) % 5000 == 0:
+                logger.info(f"  Scanned {i + 1:,}/{len(subdirs):,} directories, found {len(cavity_files):,} cavity files so far...")
+    
+    except Exception as e:
+        logger.error(f"Error scanning directory {cavities_dir}: {e}")
+        raise
     
     logger.info(f"Found {len(cavity_files):,} cavity PDB files")
     
@@ -350,7 +380,11 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     logger.debug(f"Running Step0-cabbage.sh with Sample_pockets: {sample_pockets_dir}")
     cmd = ["./Step0-cabbage.sh", sample_pockets_dir]
     # Use cwd parameter instead of os.chdir() to avoid threading issues
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cabbage_dir)
+    # Add timeout to prevent hanging (300s = 5 min should be enough for cabbage generation)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=cabbage_dir, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Cabbage generation timed out after 300s for {output_name}")
     
     if result.returncode != 0:
         raise RuntimeError(f"Cabbage generation failed: {result.stderr}")
@@ -369,7 +403,7 @@ def generate_cabbage_file(pm_dir, pocket_files, output_name="outfile.cabbage", a
     return cabbage_file, name_mapping
 
 
-def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full):
+def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full, timeout=600):
     """
     Run PocketMatch typeB comparison (chunk vs full set).
     
@@ -377,6 +411,7 @@ def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full):
         pm_dir: PocketMatch directory
         cabbage_chunk: Path to cabbage file for chunk
         cabbage_full: Path to cabbage file for full set
+        timeout: Maximum seconds to wait for comparison (default: 600 = 10 minutes)
         
     Returns:
         Path to output file
@@ -390,10 +425,13 @@ def run_pocketmatch_typeB(pm_dir, cabbage_chunk, cabbage_full):
     if cabbage_full != full_local:
         shutil.copy2(cabbage_full, full_local)
     
-    # Run PocketMatch typeB
+    # Run PocketMatch typeB with timeout to prevent hanging
     cmd = ["./Step3-PM_typeB", os.path.basename(chunk_local), os.path.basename(full_local)]
     # Use cwd parameter instead of os.chdir() to avoid threading issues
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=pm_dir)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=pm_dir, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"PocketMatch typeB timed out after {timeout}s for {os.path.basename(chunk_local)} vs {os.path.basename(full_local)}")
     
     if result.returncode != 0:
         raise RuntimeError(f"PocketMatch typeB failed with code {result.returncode}. stderr: {result.stderr}, stdout: {result.stdout}")
@@ -1291,61 +1329,83 @@ def get_pm_similarities_parallel(cavities_dir, output_dir, pm_base_dir, af_base_
             }
             logger.info(f"Submitted {len(futs)} comparison jobs (on-demand workspaces)")
             
-            completed = tqdm(concurrent.futures.as_completed(futs, timeout=14400), total=len(futs), desc="   Comparisons")
-            for fut in completed:
-                completed_count += 1
-                
-                try:
-                    result = fut.result(timeout=300)  # 5min per comparison
-                    all_pair_results.append(result)
-                    if result is None or len(result) == 0:
-                        empty_result_count += 1
-                except concurrent.futures.TimeoutError:
-                    pair_id = futs[fut]
-                    logger.error(f"Pair {pair_id}: Timeout after 5 minutes")
-                    all_pair_results.append(pd.DataFrame())
-                    empty_result_count += 1
-                except Exception as e:
-                    pair_id = futs[fut]
-                    logger.error(f"Pair {pair_id}: Error - {e}")
-                    all_pair_results.append(pd.DataFrame())
-                    empty_result_count += 1
-                
-                # Periodic progress logging
-                if completed_count - last_progress_log >= PROGRESS_LOG_INTERVAL:
-                    logger.info(f"Progress: {completed_count}/{len(futs)} comparisons, "
-                              f"{len(all_pair_results)} in memory, "
-                              f"{empty_result_count} empty, "
-                              f"{batch_counter} batches saved, "
-                              f"{len([f for f in io_futures if not f.done()])} saves pending")
-                    last_progress_log = completed_count
-                
-                # Check if we should save a batch to disk
-                valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
-                if valid_results:
-                    total_rows = sum(len(df) for df in valid_results)
-                    logger.debug(f"Batch check: {len(valid_results)} DataFrames, {total_rows:,} rows (threshold: {BATCH_SIZE:,})")
+            try:
+                completed = tqdm(concurrent.futures.as_completed(futs, timeout=14400), total=len(futs), desc="   Comparisons")
+                for fut in completed:
+                    completed_count += 1
                     
-                    if total_rows >= BATCH_SIZE:
-                        logger.info(f"Batch threshold reached: {total_rows:,} rows >= {BATCH_SIZE:,}")
-                        os.makedirs(chunk_dir, exist_ok=True)
-                        chunk_file = os.path.join(chunk_dir, f'chunk_{batch_counter:04d}.csv')
+                    try:
+                        result = fut.result(timeout=300)  # 5min per comparison
+                        all_pair_results.append(result)
+                        if result is None or len(result) == 0:
+                            empty_result_count += 1
+                    except concurrent.futures.TimeoutError:
+                        pair_id = futs[fut]
+                        logger.error(f"Pair {pair_id}: Timeout after 5 minutes")
+                        all_pair_results.append(pd.DataFrame())
+                        empty_result_count += 1
+                    except Exception as e:
+                        pair_id = futs[fut]
+                        logger.error(f"Pair {pair_id}: Error - {e}")
+                        all_pair_results.append(pd.DataFrame())
+                        empty_result_count += 1
+                    
+                    # Periodic progress logging
+                    if completed_count - last_progress_log >= PROGRESS_LOG_INTERVAL:
+                        logger.info(f"Progress: {completed_count}/{len(futs)} comparisons, "
+                                  f"{len(all_pair_results)} in memory, "
+                                  f"{empty_result_count} empty, "
+                                  f"{batch_counter} batches saved, "
+                                  f"{len([f for f in io_futures if not f.done()])} saves pending")
+                        last_progress_log = completed_count
+                    
+                    # Check if we should save a batch to disk
+                    valid_results = [df for df in all_pair_results if df is not None and len(df) > 0]
+                    if valid_results:
+                        total_rows = sum(len(df) for df in valid_results)
+                        logger.debug(f"Batch check: {len(valid_results)} DataFrames, {total_rows:,} rows (threshold: {BATCH_SIZE:,})")
                         
-                        # Prepare batch for background save (copy to avoid race conditions)
-                        batch_df = pd.concat(valid_results, ignore_index=True)
-                        
-                        # Submit to background I/O thread
-                        logger.info(f"Submitting batch {batch_counter} to background I/O thread...")
-                        io_future = io_executor.submit(save_batch_background, batch_df.copy(), chunk_file, batch_counter)
-                        io_futures.append(io_future)
-                        saved_chunks.append(chunk_file)
-                        batch_counter += 1
-                        
-                        # Clear memory immediately (background thread has its own copy)
-                        rows_cleared = len(batch_df)
-                        all_pair_results = []
-                        del batch_df
-                        logger.debug(f"Memory cleared: {rows_cleared:,} rows freed")
+                        if total_rows >= BATCH_SIZE:
+                            logger.info(f"Batch threshold reached: {total_rows:,} rows >= {BATCH_SIZE:,}")
+                            os.makedirs(chunk_dir, exist_ok=True)
+                            chunk_file = os.path.join(chunk_dir, f'chunk_{batch_counter:04d}.csv')
+                            
+                            # Prepare batch for background save (copy to avoid race conditions)
+                            batch_df = pd.concat(valid_results, ignore_index=True)
+                            
+                            # Submit to background I/O thread
+                            logger.info(f"Submitting batch {batch_counter} to background I/O thread...")
+                            io_future = io_executor.submit(save_batch_background, batch_df.copy(), chunk_file, batch_counter)
+                            io_futures.append(io_future)
+                            saved_chunks.append(chunk_file)
+                            batch_counter += 1
+                            
+                            # Clear memory immediately (background thread has its own copy)
+                            rows_cleared = len(batch_df)
+                            all_pair_results = []
+                            del batch_df
+                            logger.debug(f"Memory cleared: {rows_cleared:,} rows freed")
+            
+            except concurrent.futures.TimeoutError:
+                # Global timeout on as_completed - save what we have and continue
+                incomplete_count = sum(1 for f in futs if not f.done())
+                logger.warning(f"Global timeout reached! {incomplete_count} futures still pending.")
+                logger.warning(f"Saving completed results and continuing...")
+                
+                # Cancel pending futures (note: this may not stop running subprocesses)
+                for fut in futs:
+                    if not fut.done():
+                        fut.cancel()
+                
+                # Log which pairs were incomplete for resume
+                incomplete_pairs = [futs[f] for f in futs if not f.done()]
+                if incomplete_pairs:
+                    logger.info(f"Incomplete pairs (first 20): {incomplete_pairs[:20]}")
+                    incomplete_log = os.path.join(output_dir, 'incomplete_pairs.txt')
+                    with open(incomplete_log, 'w') as f:
+                        for pair_id in incomplete_pairs:
+                            f.write(f"{pair_id}\n")
+                    logger.info(f"Full list of incomplete pairs saved to: {incomplete_log}")
         
         # Wait for all background I/O operations to complete
         logger.info(f"Waiting for {len(io_futures)} background save operations to complete...")

@@ -59,7 +59,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # --- Configuration ---
 # --- IMPORTANT: ADJUST THESE PATHS AS PER YOUR SYSTEM ---
-CONSENSUS_DOCKER_SCRIPT = "/workspace/consensus_docking/consensus_docker.py"
+CONSENSUS_DOCKER_SCRIPT = "/home/onur/repos/consensus_docking/consensus_docker.py"
 PROCESSED_LIGAND_SDF_FOLDER = "drugbank_approved_split" # The output folder from your RDKit 3D processing script
 DRUG_TO_PROTEIN_TSV = "1_drug_to_protein.tsv"
 SMALL_MOLECULE_DRUGS_CSV = "small_molecule_drug_links.csv"  # Small molecule drugs only
@@ -70,6 +70,10 @@ ALPHAFOLD_MAPPING_CSV = "alphafold_mapping.csv" # Alternative input from extract
 PDBQT_MAPPING_CSV = "pdbqt_mapping.csv" # Input file from convert_pdb_to_pdbqt.py (optional)
 REQUIRED_STRUCTURES_WITH_NEGATIVES_CSV = "required_structures_with_negatives.csv"  # Input from generate_negative_samples.py (preferred if exists)
 LOG_FILE = "docking_automation.log"
+
+# Base folder containing per-job output directories. Used by RMSD-only mode.
+# Must match the folder where your previous docking outputs live.
+OUTPUT_BASE_FOLDER = "/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/consensus_docking_results"
 # --- TEST MODE: Set to True to run only a limited number of docking jobs for testing ---
 TEST_MODE = False
 MAX_TEST_JOBS = 40
@@ -78,7 +82,7 @@ SKIP_CONFIRMATION = True  # Set to True for nohup/batch execution
 # --- DOCKING TOOLS SELECTION ---
 # Set to True to enable each docking tool, False to disable
 USE_SMINA = False                # Enable/disable Smina docking
-USE_GNINA = True               # Enable/disable Gnina docking
+USE_GNINA = False               # Enable/disable Gnina docking
 USE_GOLD = False                 # Enable/disable Gold docking  
 USE_LEDOCK = False               # Enable/disable LeDock docking
 USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
@@ -87,7 +91,7 @@ USE_RMSD_CALCULATION = True     # Enable/disable final RMSD calculation
 USE_ADAPTIVE_EXHAUSTIVENESS = False  # Use adaptive exhaustiveness for Smina (new feature)
 MAX_EXHAUSTIVENESS = 24             # Maximum exhaustiveness when adaptive mode is enabled
 UPDATE_SMINA_ONLY = False            # If True, only update Smina results, preserve Gold/LeDock
-FORCE_RMSD_RECALCULATION = False     # If True, force RMSD recalculation even if final results exist
+FORCE_RMSD_RECALCULATION = True     # If True, force RMSD recalculation even if final results exist
 
 # --- DYNAMIC RESOURCE MANAGEMENT ---
 # NEW: Real-time job submission based on CPU availability (no batching)
@@ -119,7 +123,7 @@ LEDOCK_MAX_PARALLEL_JOBS = 60   # Maximum parallel jobs for ledock stage
 LEDOCK_EXHAUSTIVENESS = 12      # Kept for compatibility but ignored by LeDock (single-threaded)
 LEDOCK_TIMEOUT = 1200            # Timeout for ledock jobs in seconds (20 minutes)
 # Stage 5: RMSD calculation (if all tools completed but final results missing)
-RMSD_MAX_PARALLEL_JOBS = 60     # Maximum parallel jobs for RMSD calculation
+RMSD_MAX_PARALLEL_JOBS = 16     # Maximum parallel jobs for RMSD calculation
 RMSD_TIMEOUT = 3000              # Timeout for RMSD calculation in seconds
 # --- Consensus Docker Fixed Arguments (from your example) ---
 SMINA_PATH = "/opt/anaconda3/envs/teachopencadd/bin/smina"
@@ -1630,21 +1634,21 @@ def run_single_rmsd_job(job_data):
     dict
         Results of the RMSD calculation
     """
-    # Extract job parameters
-    job_idx = job_data['job_idx']
-    drugbank_id = job_data['drugbank_id']
-    uniprot_id = job_data['uniprot_id']
-    gene_name = job_data['gene_name']
-    ligand_sdf = job_data['ligand_sdf']
-    receptor_pdb = job_data['receptor_pdb']
-    receptor_pdbqt = job_data['receptor_pdbqt']
-    pocket_pdb = job_data['pocket_pdb']
+    # Extract job parameters (keep tolerant for RMSD-only scan mode)
+    job_idx = job_data.get('job_idx', -1)
+    drugbank_id = job_data.get('drugbank_id', 'unknown')
+    uniprot_id = job_data.get('uniprot_id', 'unknown')
+    gene_name = job_data.get('gene_name', 'unknown')
+    ligand_sdf = job_data.get('ligand_sdf')
+    receptor_pdb = job_data.get('receptor_pdb')
+    receptor_pdbqt = job_data.get('receptor_pdbqt')
+    pocket_pdb = job_data.get('pocket_pdb')
     current_outfolder = job_data['current_outfolder']
     
     # Get configuration from job_data
     CONSENSUS_DOCKER_SCRIPT = job_data['consensus_docker_script']
-    NUM_THREADS = job_data['num_threads']
-    CUTOFF_VALUE = job_data['cutoff_value']
+    num_threads = job_data.get('num_threads', NUM_THREADS)
+    cutoff_value = job_data.get('cutoff_value', CUTOFF_VALUE)
     FORCE_RMSD_RECALCULATION = job_data.get('force_rmsd_recalculation', False)
     
     process_id = os.getpid()
@@ -1656,7 +1660,6 @@ def run_single_rmsd_job(job_data):
             if os.path.exists(final_results_file):
                 os.remove(final_results_file)
                 logging.debug(f"Removed final results file for recalculation: {final_results_file}")
-                os.remove(final_results_file)
                 logging.debug(f"Job {job_idx}: Removed existing final results for forced recalculation")
         
         # Check if final results already exist (after potential removal)
@@ -1678,15 +1681,21 @@ def run_single_rmsd_job(job_data):
         # This flag skips all docking and only performs RMSD calculations
         command = [
             "python", CONSENSUS_DOCKER_SCRIPT,
-            "--only_rmsd",  # NEW: Skip docking, only calculate RMSD
+            "--only_rmsd",  # Skip docking, only calculate RMSD
             "--overwrite",  # Allow writing to existing directory
             "--outfolder", current_outfolder,
-            "--ligand_sdf", ligand_sdf,
-            "--receptor_pdb", receptor_pdb,
-            "--pocket_pdb", pocket_pdb,
-            "--num_threads", str(NUM_THREADS),
-            "--cutoff_value", str(CUTOFF_VALUE)
+            "--num_threads", str(num_threads),
+            "--cutoff_value", str(cutoff_value)
         ]
+
+        # Provide optional inputs only if available. RMSD-only mode in consensus_docker.py
+        # should not require these, but keeping them when known preserves compatibility.
+        if ligand_sdf:
+            command.extend(["--ligand_sdf", ligand_sdf])
+        if receptor_pdb:
+            command.extend(["--receptor_pdb", receptor_pdb])
+        if pocket_pdb:
+            command.extend(["--pocket_pdb", pocket_pdb])
         
         # Add PDBQT file if available
         if receptor_pdbqt and os.path.exists(receptor_pdbqt):
@@ -1755,6 +1764,72 @@ def run_single_rmsd_job(job_data):
             'message': f'Exception occurred in RMSD calculation: {str(e)}',
             'process_id': process_id
         }
+
+
+def discover_existing_output_folders(output_base_folder):
+    """Return sorted list of immediate subdirectories under output_base_folder."""
+    output_base_folder = os.path.abspath(output_base_folder)
+    if not os.path.isdir(output_base_folder):
+        logging.error(f"Output base folder does not exist or is not a directory: {output_base_folder}")
+        return []
+
+    subdirs = []
+    for name in os.listdir(output_base_folder):
+        p = os.path.join(output_base_folder, name)
+        if os.path.isdir(p):
+            subdirs.append(p)
+    subdirs.sort()
+    return subdirs
+
+
+def run_rmsd_only_workflow_from_existing_outputs(output_base_folder):
+    """RMSD-only workflow that skips TSV/CSV/mapping loads and scans existing outfolders."""
+    logging.info("RMSD-only mode active (all docking tools disabled).")
+    logging.info(f"Scanning existing output folders under: {output_base_folder}")
+
+    outfolders = discover_existing_output_folders(output_base_folder)
+    logging.info(f"Found {len(outfolders)} existing output folders")
+
+    if TEST_MODE and len(outfolders) > MAX_TEST_JOBS:
+        logging.info(f"TEST MODE: Limiting RMSD-only run to first {MAX_TEST_JOBS} folders")
+        outfolders = outfolders[:MAX_TEST_JOBS]
+
+    rmsd_jobs = []
+    for job_idx, current_outfolder in enumerate(outfolders):
+        # In RMSD-only scan mode, avoid reading tool folders/results.csv.
+        # Only check whether final_results.csv exists and looks complete.
+        final_done = check_final_results_completion(current_outfolder)
+
+        if (not final_done) or FORCE_RMSD_RECALCULATION:
+            rmsd_jobs.append({
+                'job_idx': job_idx,
+                'drugbank_id': os.path.basename(current_outfolder),
+                'uniprot_id': 'unknown',
+                'gene_name': 'unknown',
+                'ligand_sdf': None,
+                'receptor_pdb': None,
+                'receptor_pdbqt': None,
+                'pocket_pdb': None,
+                'current_outfolder': os.path.abspath(current_outfolder),
+                'consensus_docker_script': CONSENSUS_DOCKER_SCRIPT,
+                'num_threads': NUM_THREADS,
+                'cutoff_value': CUTOFF_VALUE,
+                'force_rmsd_recalculation': FORCE_RMSD_RECALCULATION,
+                'timeout': RMSD_TIMEOUT,
+            })
+
+    if not rmsd_jobs:
+        logging.info("No jobs need RMSD calculation - all already have final results and force recalculation is off")
+        return
+
+    logging.info(f"Submitting {len(rmsd_jobs)} RMSD jobs from existing outputs")
+    _ = run_stage_jobs(
+        job_data_list=rmsd_jobs,
+        stage_name="Stage 5: RMSD Calculation (RMSD-only scan)",
+        job_function=run_single_rmsd_job,
+        max_workers=RMSD_MAX_PARALLEL_JOBS,
+        timeout=RMSD_TIMEOUT,
+    )
 
 # --- Part 3: Main Docking Execution Logic ---
 
@@ -1826,18 +1901,15 @@ def run_stage_jobs(job_data_list, stage_name, job_function, max_workers, timeout
                     unique_processes.add(result['process_id'])
                 
                 if result['success']:
-                    if result['action'] == 'completed':
-                        completed_jobs += 1
-                        logging.info(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
-                    elif result['action'] == 'skipped':
+                    # Treat any successful run as completed, except explicit skips.
+                    # This folds RMSD force-recalculation successes (action='recalculated') into completed.
+                    if result.get('action') == 'skipped':
                         skipped_jobs += 1
                         # Log skipped jobs at INFO level to ensure they're visible
                         logging.info(f"{stage_name} Job {result['job_idx']+1}: SKIPPED - {result['message']} (Process: {result['process_id']})")
-                        # Check output folder structure and verify the results file does exist
-                        output_folder = result.get('current_outfolder', 'unknown')
-                        if 'current_outfolder' in result:
-                            tool_result_file = os.path.join(output_folder, stage_name.split(':')[-1].strip().lower(), "results.csv")
-                            logging.info(f"Verified skipping - Results file exists: {os.path.exists(tool_result_file)}")
+                    else:
+                        completed_jobs += 1
+                        logging.info(f"{stage_name} Job {result['job_idx']+1}: {result['message']} (Process: {result['process_id']})")
                 else:
                     if result['action'] == 'timeout':
                         timeout_jobs += 1
@@ -2277,7 +2349,8 @@ def run_docking(
                 tools_complete = False
             
             # Only add to RMSD jobs if all enabled tools are complete but final results don't exist
-            if tools_complete and not status['final_results']:
+            # OR if we're forcing recalculation
+            if tools_complete and (not status['final_results'] or FORCE_RMSD_RECALCULATION):
                 rmsd_jobs.append(job_data)
         
         if rmsd_jobs:
@@ -2536,7 +2609,18 @@ if __name__ == "__main__":
     # 2. Parse command-line arguments if needed
     # (none for now, using config variables)
     
-    # 3. Load necessary data for docking
+    # 3. If docking tools are disabled, skip data loading and only compute RMSD from existing outputs
+    if USE_RMSD_CALCULATION and not any([USE_SMINA, USE_GNINA, USE_GOLD, USE_LEDOCK]):
+        try:
+            run_rmsd_only_workflow_from_existing_outputs(OUTPUT_BASE_FOLDER)
+            sys.exit(0)
+        except Exception as e:
+            logging.critical(f"Critical error in RMSD-only execution: {e}")
+            import traceback
+            logging.critical(traceback.format_exc())
+            sys.exit(1)
+
+    # 4. Load necessary data for docking
     try:
         # Load drug-target combinations (from required_structures_with_negatives.csv if available)
         drug_to_protein_df, combinations_source, has_explicit_cavities = load_drug_target_combinations()
@@ -2573,5 +2657,4 @@ if __name__ == "__main__":
         logging.critical(f"Critical error in main execution: {e}")
         import traceback
         logging.critical(traceback.format_exc())
-        sys.exit(1)
         sys.exit(1)

@@ -33,6 +33,12 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 pd.options.mode.chained_assignment = None
 
+# =============================================================================
+# GLOBAL CONFIGURATION - Modify these paths as needed
+# =============================================================================
+BASE_DIR = "/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock"
+POCKET_CLUSTERS_DIR = os.path.join(BASE_DIR, "pocketmatch_results", "pocket_clusters")
+
 # Performance settings
 CHUNK_SIZE = 10000  # For chunked processing
 MAX_WORKERS_SEARCH = None  # Use all cores for search
@@ -891,6 +897,126 @@ def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_c
     
     return df
 
+def integrate_louvain_pocket_clusters(df, pocket_clusters_dir=None):
+    """
+    Integrate Louvain community detection cluster assignments from PocketMatch analysis.
+    Adds cluster membership columns for different Pmax thresholds.
+    
+    Args:
+        df: DataFrame with docking results
+        pocket_clusters_dir: Directory containing pocket_louvain_clusters_*.csv files
+    
+    Returns:
+        DataFrame with additional Louvain cluster columns
+    """
+    if df.empty:
+        return df
+    
+    if pocket_clusters_dir is None:
+        pocket_clusters_dir = POCKET_CLUSTERS_DIR
+    
+    print(f"\n🔗 STEP: Integrating Louvain pocket cluster data...")
+    print(f"   Cluster directory: {pocket_clusters_dir}")
+    
+    try:
+        import re
+        from pathlib import Path
+        
+        cluster_dir = Path(pocket_clusters_dir)
+        if not cluster_dir.exists():
+            print(f"   ⚠️  Cluster directory not found: {pocket_clusters_dir}")
+            return df
+        
+        # Find all cluster files
+        cluster_files = sorted(cluster_dir.glob('pocket_louvain_clusters_*.csv'))
+        
+        if not cluster_files:
+            print(f"   ⚠️  No cluster files found in {pocket_clusters_dir}")
+            return df
+        
+        print(f"   Found {len(cluster_files)} cluster files")
+        
+        # Create pocket identifier column from source_dir if not exists
+        # Format: AF-{uniprot_id}-F1-model_v1_cavity_{cavity_num}.pdb
+        if 'pocket_id' not in df.columns:
+            # Try to construct pocket_id from source_dir
+            if 'source_dir' in df.columns:
+                def extract_pocket_id(source_dir):
+                    """Extract pocket identifier from source directory path."""
+                    if pd.isna(source_dir):
+                        return None
+                    # Path format: .../DB00390_ATP1A1_Q13286_cavity_3/...
+                    match = re.search(r'([A-Z0-9]+)_cavity_(\d+)', str(source_dir))
+                    if match:
+                        uniprot_id, cavity_num = match.groups()
+                        return f"AF-{uniprot_id}-F1-model_v1_cavity_{cavity_num}.pdb"
+                    return None
+                
+                df['pocket_id'] = df['source_dir'].apply(extract_pocket_id)
+                valid_pocket_ids = df['pocket_id'].notna().sum()
+                print(f"   Extracted pocket_id: {valid_pocket_ids:,} non-null values")
+            else:
+                # Try to construct from uniprot_id and cavity_index
+                if 'uniprot_id' in df.columns and 'cavity_index' in df.columns:
+                    df['pocket_id'] = df.apply(
+                        lambda row: f"AF-{row['uniprot_id']}-F1-model_v1_cavity_{int(row['cavity_index'])}.pdb" 
+                        if pd.notna(row['uniprot_id']) and pd.notna(row['cavity_index']) else None,
+                        axis=1
+                    )
+                    valid_pocket_ids = df['pocket_id'].notna().sum()
+                    print(f"   Constructed pocket_id: {valid_pocket_ids:,} non-null values")
+                else:
+                    print(f"   ⚠️  Cannot construct pocket_id - missing required columns")
+                    return df
+        
+        # Load and merge each cluster file
+        for cluster_file in cluster_files:
+            # Extract Pmax threshold from filename (e.g., pocket_louvain_clusters_0p3.csv -> 0.3)
+            filename = cluster_file.stem
+            pmax_match = re.search(r'(\d+)p(\d+)', filename)
+            if pmax_match:
+                pmax_str = f"{pmax_match.group(1)}.{pmax_match.group(2)}"
+                pmax_val = float(pmax_str)
+            else:
+                continue
+            
+            # Load cluster data
+            cluster_df = pd.read_csv(cluster_file)
+            
+            # Rename columns to include Pmax threshold
+            cluster_col_name = f"louvain_cluster_pmax{pmax_str.replace('.', '')}"
+            cluster_size_col_name = f"louvain_cluster_size_pmax{pmax_str.replace('.', '')}"
+            
+            cluster_df = cluster_df.rename(columns={
+                'Pocket': 'pocket_id',
+                'Cluster': cluster_col_name,
+                'ClusterSize': cluster_size_col_name
+            })
+            
+            # Merge with main dataframe
+            before_merge = len(df)
+            df = df.merge(
+                cluster_df[['pocket_id', cluster_col_name, cluster_size_col_name]], 
+                on='pocket_id', 
+                how='left'
+            )
+            
+            matched = df[cluster_col_name].notna().sum()
+            n_clusters = df[cluster_col_name].nunique()
+            print(f"   Pmax >= {pmax_val}: {matched:,} matched ({matched/len(df)*100:.1f}%), {n_clusters} unique clusters")
+        
+        # Summary
+        louvain_cols = [col for col in df.columns if col.startswith('louvain_cluster_pmax')]
+        print(f"   ✅ Added {len(louvain_cols)} Louvain cluster columns")
+        
+    except Exception as e:
+        print(f"   ⚠️  Error integrating Louvain clusters: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return df
+
+
 def filter_complete_tool_coverage(df):
     """
     Filter for drug-target pairs where ALL tools made predictions.
@@ -1066,6 +1192,7 @@ def export_prepared_data_optimized(df, output_dir="./"):
             'cavity_cluster_integration',
             'ic50_integration',
             'sample_type_annotation',
+            'louvain_pocket_cluster_integration',
             'complete_tool_coverage_filter',
             'balanced_sampling'
         ],
@@ -1104,6 +1231,7 @@ def main():
     print("  ✓ Cavity cluster integration")
     print("  ✓ IC50 experimental data")
     print("  ✓ Sample type annotation")
+    print("  ✓ Louvain pocket cluster integration (PocketMatch)")
     print("  ✓ Complete tool coverage filtering")
     print("  ✓ Balanced positive/negative sampling")
     print("=" * 60)
@@ -1112,12 +1240,16 @@ def main():
     print(f"💻 System: {system_info['cpu_count']} cores, {system_info['memory_gb']:.1f}GB RAM")
     print(f"💾 Available: {system_info['available_memory_gb']:.1f}GB")
     
+    print(f"\n📁 Using BASE_DIR: {BASE_DIR}")
+    
     # Step 1: File Discovery
     print(f"\n{'='*60}")
     print(f"PHASE 1: FILE DISCOVERY")
     print(f"{'='*60}")
+    # Search in parent directory to find all consensus docking files
+    search_dir = os.path.dirname(BASE_DIR)
     result_files = find_consensus_results_files_optimized(
-        base_directory="/media/onur/Elements/cavity_space_consensus_docking",
+        base_directory=search_dir,
         max_workers=min(multiprocessing.cpu_count(), 12)
     )
     
@@ -1160,20 +1292,23 @@ def main():
     # Step 7: Annotate Sample Types
     cleaned_data = annotate_sample_types(cleaned_data)
     
-    # Step 8: Filter for Complete Tool Coverage
+    # Step 8: Integrate Louvain Pocket Clusters
+    cleaned_data = integrate_louvain_pocket_clusters(cleaned_data, POCKET_CLUSTERS_DIR)
+    
+    # Step 9: Filter for Complete Tool Coverage
     print(f"\n{'='*60}")
     print(f"PHASE 5: FILTERING & BALANCING")
     print(f"{'='*60}")
     cleaned_data = filter_complete_tool_coverage(cleaned_data)
     
-    # Step 9: Balance Positive/Negative Samples
+    # Step 10: Balance Positive/Negative Samples
     cleaned_data = balance_positive_negative_samples(cleaned_data)
     
-    # Step 10: Data Export
+    # Step 11: Data Export
     print(f"\n{'='*60}")
     print(f"PHASE 6: FINAL EXPORT")
     print(f"{'='*60}")
-    export_results = export_prepared_data_optimized(cleaned_data, output_dir="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/")
+    export_results = export_prepared_data_optimized(cleaned_data, output_dir=BASE_DIR)
     
     # Final Performance Summary
     total_time = time.time() - total_start_time
