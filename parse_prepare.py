@@ -39,6 +39,24 @@ pd.options.mode.chained_assignment = None
 BASE_DIR = "/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock"
 POCKET_CLUSTERS_DIR = os.path.join(BASE_DIR, "pocketmatch_results", "pocket_clusters")
 
+# DTA-ATLAS dataset (DL binding affinity predictions)
+DTA_ATLAS_DIR = os.path.join(
+    BASE_DIR,
+    "dta_atlas_data",
+    "home",
+    "madinasu",
+    "convertedData",
+    "dta_atlas_dataset_1_0",
+)
+
+# DTA-ATLAS integration tunables
+# - Batch size controls how many rows are processed at a time per parquet shard.
+# - Max workers controls parallel file scanning (threads).
+#   Increase if you have fast storage; decrease if you see disk thrashing.
+DTA_ATLAS_BATCH_SIZE = 200_000
+DTA_ATLAS_MAX_WORKERS = 24
+DTA_ATLAS_PARALLEL = True
+
 # Performance settings
 CHUNK_SIZE = 10000  # For chunked processing
 MAX_WORKERS_SEARCH = None  # Use all cores for search
@@ -226,6 +244,7 @@ def categorize_found_files(all_results):
         'smina_results': [],
         'gold_results': [],
         'ledock_results': [],
+        'gnina_results': [],
         'combined_results': []
     }
     
@@ -247,6 +266,8 @@ def categorize_found_files(all_results):
                 categorized['gold_results'].append(file_path)
             elif 'ledock' in dir_path and 'results.csv' in file_name:
                 categorized['ledock_results'].append(file_path)
+            elif 'gnina' in dir_path and 'results.csv' in file_name:
+                categorized['gnina_results'].append(file_path)
             elif 'smina' in file_name:
                 categorized['smina_results'].append(file_path)
             elif 'gold' in file_name:
@@ -316,6 +337,8 @@ def optimized_file_loader(file_info):
             metadata['source_type'] = 'gold_results'
         elif '/ledock/' in path_lower or 'ledock' in os.path.basename(path_lower):
             metadata['source_type'] = 'ledock_results'
+        elif '/gnina/' in path_lower or 'gnina' in os.path.basename(path_lower):
+            metadata['source_type'] = 'gnina_results'
         elif 'combined' in path_lower:
             metadata['source_type'] = 'combined_results'
         else:
@@ -602,6 +625,7 @@ def clean_and_prepare_data_optimized(df):
                 'Smina': 'Smina',
                 'Gold': 'Gold', 
                 'Ledock': 'LeDock',
+                'Gnina': 'Gnina',
                 'Final': 'Consensus'
             }
             clean_df['primary_tool'] = clean_df['primary_tool'].map(tool_mapping).fillna(clean_df['primary_tool'])
@@ -721,12 +745,14 @@ def add_tool_specific_scores(df):
     print(f"\n🏷️  STEP: Adding tool-specific score columns...")
     
     # Create score columns for each tool
-    tools = ['GOLD', 'Smina', 'LeDock']
+    tools = ['GOLD', 'SMINA', 'LeDock','GNINA']
     for tool in tools:
         df[f'{tool}_Score'] = np.where(
             df['Tool1'] == tool, df['Score1'],
             np.where(df['Tool2'] == tool, df['Score2'], np.nan)
         )
+        # Reduce memory footprint (large datasets)
+        df[f'{tool}_Score'] = df[f'{tool}_Score'].astype('float32')
     
     # Report
     for tool in tools:
@@ -763,31 +789,34 @@ def integrate_cavity_clusters(df, cluster_file="/opt/data/cavity_space/cavity_cl
         print(f"   Extracted cavity_index: {non_null_cavity:,} non-null values")
         
         if non_null_uniprot > 0 and non_null_cavity > 0:
-            # Create cavity to cluster mapping
-            cavity_to_cluster = {}
-            successful_parses = 0
-            
+            # Build mapping table (vectorized merge later; avoids df.apply(axis=1) memory spikes)
+            mapping_rows = []
             for _, row in clusters_df.iterrows():
                 cluster_id = row['id']
                 cavity_items = row['items']
-                
-                if pd.notna(cavity_items):
-                    for cavity_id in str(cavity_items).split(','):
-                        cavity_id = cavity_id.strip()
-                        match = re.match(r'AF-([A-Z0-9]+)-F\d+-model_v1_C(\d+)', cavity_id)
-                        if match:
-                            uniprot_id, cavity_index = match.groups()
-                            cavity_to_cluster[(uniprot_id, int(cavity_index))] = cluster_id
-                            successful_parses += 1
-            
-            print(f"   Created mapping for {len(cavity_to_cluster):,} unique cavities")
-            
-            # Apply mapping
-            df['cavity_cluster_id'] = df.apply(
-                lambda row: cavity_to_cluster.get((row['extracted_uniprot_id'], row['extracted_cavity_index'])) if pd.notna(row['extracted_uniprot_id']) and pd.notna(row['extracted_cavity_index']) else pd.NA,
-                axis=1
-            )
-            
+                if pd.isna(cavity_items):
+                    continue
+                for cavity_id in str(cavity_items).split(','):
+                    cavity_id = cavity_id.strip()
+                    match = re.match(r'AF-([A-Z0-9]+)-F\d+-model_v1_C(\d+)', cavity_id)
+                    if not match:
+                        continue
+                    uniprot_id, cavity_index = match.groups()
+                    mapping_rows.append((uniprot_id, int(cavity_index), cluster_id))
+
+            if not mapping_rows:
+                df['cavity_cluster_id'] = pd.NA
+                return df
+
+            mapping_df = pd.DataFrame(mapping_rows, columns=['extracted_uniprot_id', 'extracted_cavity_index', 'cavity_cluster_id'])
+            mapping_df['extracted_cavity_index'] = mapping_df['extracted_cavity_index'].astype('Int64')
+            mapping_df = mapping_df.drop_duplicates(subset=['extracted_uniprot_id', 'extracted_cavity_index'], keep='first')
+
+            print(f"   Created mapping for {len(mapping_df):,} unique cavities")
+
+            # Vectorized merge
+            df = df.merge(mapping_df, on=['extracted_uniprot_id', 'extracted_cavity_index'], how='left')
+
             mapped_count = df['cavity_cluster_id'].notna().sum()
             unique_clusters = df['cavity_cluster_id'].nunique()
             print(f"   Mapped: {mapped_count:,}/{len(df):,} ({mapped_count/len(df)*100:.1f}%)")
@@ -849,6 +878,270 @@ def integrate_ic50_data(df, ic50_file="/media/onur/Elements/cavity_space_consens
         for col in ['ic50_value', 'ic50_unit', 'measurement_type', 'operator', 'pubchem_cid', 'activity', 'n_measurements']:
             df[col] = pd.NA
     
+    return df
+
+
+def _normalize_identifier_series(series: pd.Series, uppercase: bool = False) -> pd.Series:
+    """Normalize identifier string series (strip whitespace/quotes, coerce common nulls)."""
+    s = series.astype("string")
+    s = s.str.strip()
+    s = s.str.strip('"')
+    s = s.str.strip("'")
+    if uppercase:
+        s = s.str.upper()
+    s = s.replace(["", "nan", "none", "null", "unknown", "na", "n/a"], pd.NA)
+    return s
+
+
+def _process_dta_parquet_file(
+    file_path: str,
+    needed_drugs,
+    needed_uniprots,
+    needed_pairs,
+    batch_size: int,
+):
+    """Worker: scan one parquet shard and aggregate only required pairs."""
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        if not needed_drugs or not needed_uniprots or not needed_pairs:
+            return None
+
+        pf = pq.ParquetFile(file_path)
+        schema_names = pf.schema_arrow.names
+        required = {"entry_id", "drugbank_id", "uniprot_id"}
+        if not required.issubset(set(schema_names)):
+            return None
+
+        cols = schema_names
+        needed_drugs_arr = pa.array(list(needed_drugs))
+        needed_uniprots_arr = pa.array(list(needed_uniprots))
+
+        agg_sum = None
+        agg_cnt = None
+        agg_rows = None
+        agg_entry = None
+
+        for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
+            table = pa.Table.from_batches([batch])
+
+            # Fast coarse filter: only keep rows where drugbank_id and uniprot_id are in our sets.
+            try:
+                mask_drug = pc.is_in(table["drugbank_id"], value_set=needed_drugs_arr)
+                mask_uni = pc.is_in(table["uniprot_id"], value_set=needed_uniprots_arr)
+                mask = pc.and_(mask_drug, mask_uni)
+                filtered = table.filter(mask)
+            except Exception:
+                # If arrow-level filtering fails for any reason, fall back to pandas filtering.
+                filtered = table
+
+            if filtered.num_rows == 0:
+                continue
+
+            chunk = filtered.to_pandas()
+            if chunk.empty:
+                continue
+
+            # Normalize identifiers on the reduced chunk only
+            chunk["drugbank_id"] = _normalize_identifier_series(chunk["drugbank_id"], uppercase=True)
+            chunk["uniprot_id"] = _normalize_identifier_series(chunk["uniprot_id"], uppercase=True)
+            chunk["entry_id"] = _normalize_identifier_series(chunk["entry_id"], uppercase=False)
+            chunk = chunk.dropna(subset=["drugbank_id", "uniprot_id"])
+            if chunk.empty:
+                continue
+
+            pair_key = chunk["drugbank_id"].astype(str) + "\t" + chunk["uniprot_id"].astype(str)
+            chunk = chunk[pair_key.isin(needed_pairs)]
+            if chunk.empty:
+                continue
+
+            chunk = chunk.rename(columns={"entry_id": "dta_entry_id"})
+            key_cols = {"drugbank_id", "uniprot_id"}
+            rename_map = {c: f"dta_{c}" for c in chunk.columns if c not in key_cols and not c.startswith("dta_")}
+            chunk = chunk.rename(columns=rename_map)
+
+            group = chunk.groupby(["drugbank_id", "uniprot_id"], sort=False)
+
+            file_rows = group.size().rename("dta_n_rows")
+
+            non_key_cols = [c for c in chunk.columns if c not in ("drugbank_id", "uniprot_id")]
+            numeric_cols = [c for c in non_key_cols if pd.api.types.is_numeric_dtype(chunk[c])]
+            other_cols = [c for c in non_key_cols if c not in numeric_cols]
+
+            file_sum = group[numeric_cols].sum(min_count=1) if numeric_cols else None
+            file_cnt = group[numeric_cols].count() if numeric_cols else None
+            file_entry = group["dta_entry_id"].first() if "dta_entry_id" in other_cols else None
+
+            if file_sum is not None:
+                if agg_sum is None:
+                    agg_sum = file_sum
+                    agg_cnt = file_cnt
+                else:
+                    agg_sum = agg_sum.add(file_sum, fill_value=0)
+                    agg_cnt = agg_cnt.add(file_cnt, fill_value=0)
+
+            if agg_rows is None:
+                agg_rows = file_rows
+            else:
+                agg_rows = agg_rows.add(file_rows, fill_value=0)
+
+            if file_entry is not None:
+                if agg_entry is None:
+                    agg_entry = file_entry
+                else:
+                    agg_entry = agg_entry.combine_first(file_entry)
+
+            # Free per-batch objects aggressively
+            del chunk
+
+        if agg_rows is None:
+            return None
+
+        return {
+            "sum": agg_sum,
+            "cnt": agg_cnt,
+            "rows": agg_rows,
+            "entry": agg_entry,
+        }
+    except Exception:
+        return None
+
+
+def integrate_dta_atlas_data(df, dta_dir=None):
+    """
+    Integrate DTA-ATLAS binding affinity predictions.
+
+    Loads parquet shards and left-merges per-model prediction columns onto the
+    docking dataframe using (drugbank_id, uniprot_id) as join keys.
+
+    Policies:
+    - Keep all per-model columns.
+    - Prefix incoming columns with `dta_`.
+    - Store `entry_id` as `dta_entry_id`.
+    - Aggregate duplicates per (drugbank_id, uniprot_id) and add `dta_n_rows`.
+    """
+    if df.empty:
+        return df
+
+    if dta_dir is None:
+        dta_dir = DTA_ATLAS_DIR
+
+    print(f"\n🧬 STEP: Integrating DTA-ATLAS predictions...")
+    print(f"   DTA-ATLAS directory: {dta_dir}")
+
+    if not os.path.exists(dta_dir):
+        print("   ⚠️  DTA-ATLAS directory not found, skipping")
+        return df
+
+    # Determine which pairs we actually need
+    if "drugbank_id" not in df.columns or "uniprot_id" not in df.columns:
+        print("   ⚠️  Missing join keys in docking dataframe, skipping DTA-ATLAS")
+        return df
+
+    needed_drugs = set(_normalize_identifier_series(df["drugbank_id"], uppercase=True).dropna().unique())
+    needed_uniprots = set(_normalize_identifier_series(df["uniprot_id"], uppercase=True).dropna().unique())
+    needed_pairs = set(
+        (
+            _normalize_identifier_series(df["drugbank_id"], uppercase=True)
+            + "\t"
+            + _normalize_identifier_series(df["uniprot_id"], uppercase=True)
+        ).dropna().unique()
+    )
+
+    if not needed_pairs:
+        print("   ⚠️  No valid (drugbank_id, uniprot_id) pairs found, skipping DTA-ATLAS")
+        return df
+
+    parquet_files = sorted(glob.glob(os.path.join(dta_dir, "*.parquet")))
+    if not parquet_files:
+        print(f"   ⚠️  No parquet files found in {dta_dir}")
+        return df
+
+    print(f"   Docking pairs needed: {len(needed_pairs):,}")
+    print(f"   Scanning DTA-ATLAS shards: {len(parquet_files):,}")
+
+    # Streaming aggregation across shards: keep only per-pair running sums/counts
+    agg_sum = None
+    agg_cnt = None
+    agg_rows = None
+    agg_entry = None
+
+    batch_size = int(DTA_ATLAS_BATCH_SIZE)
+    max_workers = min(int(DTA_ATLAS_MAX_WORKERS), multiprocessing.cpu_count(), len(parquet_files))
+    if not DTA_ATLAS_PARALLEL:
+        max_workers = 1
+
+    if max_workers <= 1:
+        for p in tqdm(parquet_files, desc="🧬 Scanning DTA-ATLAS", unit="file"):
+            part = _process_dta_parquet_file(p, needed_drugs, needed_uniprots, needed_pairs, batch_size)
+            if not part:
+                continue
+            if part["sum"] is not None:
+                if agg_sum is None:
+                    agg_sum = part["sum"]
+                    agg_cnt = part["cnt"]
+                else:
+                    agg_sum = agg_sum.add(part["sum"], fill_value=0)
+                    agg_cnt = agg_cnt.add(part["cnt"], fill_value=0)
+            agg_rows = part["rows"] if agg_rows is None else agg_rows.add(part["rows"], fill_value=0)
+            if part["entry"] is not None:
+                agg_entry = part["entry"] if agg_entry is None else agg_entry.combine_first(part["entry"])
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_dta_parquet_file,
+                    p,
+                    needed_drugs,
+                    needed_uniprots,
+                    needed_pairs,
+                    batch_size,
+                )
+                for p in parquet_files
+            ]
+
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="🧬 Scanning DTA-ATLAS", unit="file"):
+                part = fut.result()
+                if not part:
+                    continue
+                if part["sum"] is not None:
+                    if agg_sum is None:
+                        agg_sum = part["sum"]
+                        agg_cnt = part["cnt"]
+                    else:
+                        agg_sum = agg_sum.add(part["sum"], fill_value=0)
+                        agg_cnt = agg_cnt.add(part["cnt"], fill_value=0)
+                agg_rows = part["rows"] if agg_rows is None else agg_rows.add(part["rows"], fill_value=0)
+                if part["entry"] is not None:
+                    agg_entry = part["entry"] if agg_entry is None else agg_entry.combine_first(part["entry"])
+
+    if agg_rows is None:
+        print("   ⚠️  No matching DTA-ATLAS records found for required pairs")
+        return df
+
+    # Compute per-column means from sum/count
+    out = pd.DataFrame(index=agg_rows.index)
+    out["dta_n_rows"] = agg_rows.astype("Int64")
+    if agg_entry is not None:
+        out["dta_entry_id"] = agg_entry
+
+    if agg_sum is not None and agg_cnt is not None:
+        for col in agg_sum.columns:
+            denom = agg_cnt[col].replace(0, np.nan)
+            out[col] = (agg_sum[col] / denom).astype('float32')
+
+    dta_agg = out.reset_index()
+    print(f"   Unique DTA pairs matched: {len(dta_agg):,}")
+
+    before_cols = len(df.columns)
+    df = df.merge(dta_agg, on=["drugbank_id", "uniprot_id"], how="left")
+    after_cols = len(df.columns)
+    matched = df["dta_n_rows"].notna().sum() if "dta_n_rows" in df.columns else 0
+    print(f"   Matched: {matched:,}/{len(df):,} ({matched/len(df)*100:.2f}%)")
+    print(f"   Columns: {before_cols} → {after_cols}")
+
     return df
 
 def annotate_sample_types(df, metadata_file="/media/onur/Elements/cavity_space_consensus_docking/2025_06_29_batch_dock/required_structures_with_negatives.csv"):
@@ -1039,7 +1332,7 @@ def filter_complete_tool_coverage(df):
         return df
     
     # Define expected tools
-    expected_tools = ['GOLD', 'Smina', 'LeDock']
+    expected_tools = ['GOLD', 'Smina', 'LeDock','Gnina']
     
     # Find pairs with complete coverage
     complete_pairs = []
@@ -1188,13 +1481,15 @@ def export_prepared_data_optimized(df, output_dir="./"):
         'processing_steps_applied': [
             'data_loading',
             'data_cleaning',
+            'sample_type_annotation',
+            'complete_tool_coverage_filter',
+            'balanced_sampling'
+            ,
+            'dta_atlas_integration',
             'tool_specific_scores',
             'cavity_cluster_integration',
             'ic50_integration',
-            'sample_type_annotation',
-            'louvain_pocket_cluster_integration',
-            'complete_tool_coverage_filter',
-            'balanced_sampling'
+            'louvain_pocket_cluster_integration'
         ],
         'analysis_ready': True
     }
@@ -1277,32 +1572,28 @@ def main():
     print(f"{'='*60}")
     cleaned_data = clean_and_prepare_data_optimized(consensus_data)
     
-    # Step 4: Add Tool-Specific Scores
+    # Phase 4: FILTERING & BALANCING (before heavy annotations)
     print(f"\n{'='*60}")
-    print(f"PHASE 4: ENRICHMENT & ANNOTATION")
+    print(f"PHASE 4: FILTERING & BALANCING")
     print(f"{'='*60}")
-    cleaned_data = add_tool_specific_scores(cleaned_data)
-    
-    # Step 5: Integrate Cavity Clusters
-    cleaned_data = integrate_cavity_clusters(cleaned_data)
-    
-    # Step 6: Integrate IC50 Data
-    cleaned_data = integrate_ic50_data(cleaned_data)
-    
-    # Step 7: Annotate Sample Types
+
+    # Needed for balancing
     cleaned_data = annotate_sample_types(cleaned_data)
-    
-    # Step 8: Integrate Louvain Pocket Clusters
-    cleaned_data = integrate_louvain_pocket_clusters(cleaned_data, POCKET_CLUSTERS_DIR)
-    
-    # Step 9: Filter for Complete Tool Coverage
-    print(f"\n{'='*60}")
-    print(f"PHASE 5: FILTERING & BALANCING")
-    print(f"{'='*60}")
+
+    # Reduce dataset early to avoid OOM during heavy annotations
     cleaned_data = filter_complete_tool_coverage(cleaned_data)
-    
-    # Step 10: Balance Positive/Negative Samples
     cleaned_data = balance_positive_negative_samples(cleaned_data)
+
+    # Phase 5: ENRICHMENT & ANNOTATION (apply only to final set)
+    print(f"\n{'='*60}")
+    print(f"PHASE 5: ENRICHMENT & ANNOTATION")
+    print(f"{'='*60}")
+
+    cleaned_data = integrate_dta_atlas_data(cleaned_data)
+    cleaned_data = add_tool_specific_scores(cleaned_data)
+    cleaned_data = integrate_cavity_clusters(cleaned_data)
+    cleaned_data = integrate_ic50_data(cleaned_data)
+    cleaned_data = integrate_louvain_pocket_clusters(cleaned_data, POCKET_CLUSTERS_DIR)
     
     # Step 11: Data Export
     print(f"\n{'='*60}")
